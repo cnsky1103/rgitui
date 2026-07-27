@@ -20,14 +20,26 @@ use rgitui_ui::{
 
 use crate::markdown_view::render_markdown;
 
-/// Maximum height of the changed-files list. Beyond this the list virtualizes and
-/// scrolls internally (only the visible window is built); shorter lists size to
-/// their content so the panel scrolls as one region.
-const FILE_LIST_MAX_HEIGHT: f32 = 600.0;
+/// Rows the changed-files list keeps when the header and commit message leave it
+/// little room. Once it is this short the panel scrolls as one region instead.
+const FILE_LIST_MIN_VISIBLE_ROWS: f32 = 4.0;
 const FILE_LIST_BOTTOM_PADDING: f32 = 8.0;
 
-fn bounded_file_list_height(row_count: usize, row_height: f32) -> f32 {
-    (row_count as f32 * row_height + FILE_LIST_BOTTOM_PADDING).min(FILE_LIST_MAX_HEIGHT)
+/// Height the changed-files list would like: every row plus the bottom padding.
+///
+/// The list is the only shrinkable child of the detail panel's scroll area, so
+/// flex trims this to whatever space is left below the commit message. It
+/// therefore ends exactly at the bottom of the panel — virtualizing and
+/// scrolling internally — rather than stopping at a fixed height and leaving
+/// unused space beneath it.
+fn file_list_content_height(row_count: usize, row_height: f32) -> f32 {
+    row_count as f32 * row_height + FILE_LIST_BOTTOM_PADDING
+}
+
+/// Height below which the list stops shrinking. Lists with only a few rows never
+/// grow a scrollbar, since their content height is already smaller.
+fn file_list_min_height(row_count: usize, row_height: f32) -> f32 {
+    file_list_content_height(row_count, row_height).min(FILE_LIST_MIN_VISIBLE_ROWS * row_height)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -899,7 +911,8 @@ impl DetailPanel {
         let selected_file_index = self.selected_file_index;
         let weak = cx.weak_entity();
         let row_count = filtered.len();
-        let list_height = bounded_file_list_height(row_count, row_h);
+        let list_height = file_list_content_height(row_count, row_h);
+        let list_min_height = file_list_min_height(row_count, row_h);
         // Cheap `'static` handles for the virtualized closure: the shared row
         // store and, when searching, the display->file-index mapping (`None`
         // means identity, i.e. unfiltered diff order). Only the visible window is
@@ -1002,9 +1015,9 @@ impl DetailPanel {
                     .collect()
             },
         )
-        .flex_shrink_0()
         .pb_2()
         .h(px(list_height))
+        .min_h(px(list_min_height))
         .with_sizing_behavior(ListSizingBehavior::Auto)
         .into_any_element()
     }
@@ -1030,7 +1043,8 @@ impl DetailPanel {
         let collapsed = self.collapsed_dirs.clone();
         let weak = cx.weak_entity();
         let row_count = visible.len();
-        let list_height = bounded_file_list_height(row_count, row_h);
+        let list_height = file_list_content_height(row_count, row_h);
+        let list_min_height = file_list_min_height(row_count, row_h);
         let tree_rows = tree_rows.clone();
 
         let ghost_element_selected = colors.ghost_element_selected;
@@ -1169,9 +1183,9 @@ impl DetailPanel {
                     .collect()
             },
         )
-        .flex_shrink_0()
         .pb_2()
         .h(px(list_height))
+        .min_h(px(list_min_height))
         .with_sizing_behavior(ListSizingBehavior::Auto)
         .into_any_element()
     }
@@ -1346,9 +1360,12 @@ impl Render for DetailPanel {
             .gap_3();
 
         // -- Header Card: Author + SHA + Refs --
+        // Everything above the file list keeps its full height; the list is the
+        // one child that gives up space when the panel is short.
         let mut header_card = div()
             .v_flex()
             .w_full()
+            .flex_shrink_0()
             .px(header_pad_h)
             .py(header_pad_v)
             .gap(header_gap)
@@ -1592,6 +1609,7 @@ impl Render for DetailPanel {
         let mut message_card = div()
             .v_flex()
             .w_full()
+            .flex_shrink_0()
             .px(msg_pad_h)
             .py(msg_pad_v)
             .gap(msg_gap)
@@ -1822,6 +1840,7 @@ impl Render for DetailPanel {
             let mut header = div()
                 .h_flex()
                 .w_full()
+                .flex_shrink_0()
                 .h(px(28.))
                 .px(px(10.))
                 .gap_2()
@@ -1841,6 +1860,7 @@ impl Render for DetailPanel {
                     div()
                         .h_flex()
                         .w_full()
+                        .flex_shrink_0()
                         .h(px(22.))
                         .px_3()
                         .items_center()
@@ -1860,6 +1880,7 @@ impl Render for DetailPanel {
                     div()
                         .h_flex()
                         .w_full()
+                        .flex_shrink_0()
                         .py_4()
                         .items_center()
                         .justify_center()
@@ -1906,13 +1927,19 @@ mod tests {
     use crate::time::format_relative_time_full;
 
     #[test]
-    fn bounded_file_list_height_sizes_short_lists_to_content() {
-        assert_eq!(bounded_file_list_height(3, 26.0), 86.0);
+    fn file_list_asks_for_every_row_plus_padding() {
+        assert_eq!(file_list_content_height(3, 26.0), 86.0);
+        assert_eq!(file_list_content_height(100, 26.0), 2608.0);
     }
 
     #[test]
-    fn bounded_file_list_height_caps_large_lists() {
-        assert_eq!(bounded_file_list_height(100, 26.0), FILE_LIST_MAX_HEIGHT);
+    fn long_file_lists_shrink_no_further_than_four_rows() {
+        assert_eq!(file_list_min_height(100, 26.0), 104.0);
+    }
+
+    #[test]
+    fn short_file_lists_never_reserve_more_than_their_content() {
+        assert_eq!(file_list_min_height(2, 26.0), 60.0);
     }
 
     // --- format_relative_time tests ---
