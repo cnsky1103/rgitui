@@ -1,5 +1,69 @@
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-27
+
+A focused follow-up to 0.3.1. Blame and file history are prepared before you ask
+for them and stay honestly disabled when a file has neither, diff text can be
+selected with the mouse and copied, the commit graph routes dirty worktrees
+without disturbing neighbouring lanes, and the sidebar and detail panel now size
+their lists to the space actually available instead of stopping partway down the
+panel.
+
+### Added
+
+- **Mouse selection in the diff viewer.** Drag across diff rows, or `Shift`+click
+  to extend a range from the current anchor, then copy the selected lines with
+  `Ctrl+C`. Both gestures are listed in the keyboard-shortcuts overlay.
+- **Blame and file-history prefetching.** Whenever a diff is displayed, blame and
+  history for that path load in the background, so switching to those views is
+  normally instant. Work is single-flight per repository, path, and diff
+  generation — entries are reserved before the background task starts, so a fast
+  second click cannot launch the same Git command again.
+
+### Changed
+
+- **The Blame and History tabs reflect what the file actually has.** A path with
+  no blame or no history leaves its tab dimmed and unclickable instead of opening
+  an empty view, and results that fail or return nothing are retained as
+  unavailable so the tab stays disabled.
+- **File history is anchored to the selected commit.** Opening history from a
+  commit diff stops at that commit rather than including changes made to the file
+  later on the current branch.
+- **The keyboard-shortcuts overlay adapts to the window.** The modal is clamped to
+  the viewport, falls back to a single column below 960px wide, and scrolls
+  instead of overflowing its categories.
+
+### Fixed
+
+- **Commit-graph routing for dirty worktrees.** A worktree's pending-changes node
+  is now placed as a child of its HEAD commit: it reuses the HEAD lane only when
+  that HEAD has no visible incoming child and no earlier worktree has claimed the
+  lane, and otherwise takes the first free lane with an explicit edge back to
+  HEAD. Real lanes pass through the virtual row instead of being consumed by it,
+  worktrees sharing a HEAD render as siblings rather than a chain, and a worktree
+  whose HEAD lies outside the loaded window no longer draws an edge to a false
+  parent. (#56)
+- **Sidebar sections stopped short of the panel bottom.** Expanded sections were
+  capped at twelve rows, so a long Unstaged list ended mid-panel with unusable
+  space beneath it while its remaining files were reachable only by scrolling
+  inside that small box. Section heights are now planned from the measured panel
+  height: sections that fit keep their content height, and the rest share what is
+  left down to a three-row minimum, so the sections fill the sidebar and still
+  virtualize.
+- **The changed-files list left dead space in the detail panel.** It was limited
+  to a fixed 600px regardless of window size. The list now asks for its full
+  content height and is the only part of the panel that gives up space, so it
+  ends flush with the bottom of the panel and stops shrinking at four rows.
+
+### Internal
+
+- Added `PRODUCT.md` describing the product's users, purpose, design principles,
+  and accessibility expectations.
+- `LruCache::peek` reads a cached value without disturbing recency order.
+- Added regression coverage for worktree lane layout, mouse-selection ranges,
+  file history anchored at a commit, sidebar list-height distribution, and
+  detail-panel file-list sizing.
+
 ## [0.3.1] - 2026-07-19
 
 This patch release makes large repositories and GitHub-backed workflows feel
