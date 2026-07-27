@@ -140,13 +140,83 @@ const STASH_MENU_VERTICAL_PADDING: f32 = 3.0;
 /// Number of action rows in the stash context menu (Apply, Pop, Create branch, Drop).
 const STASH_MENU_ITEM_COUNT: f32 = 4.0;
 
-/// Expanded sidebar sections remain content-sized up to this many rows. Larger
-/// sections get their own bounded scrolling viewport so `uniform_list` can
-/// render only the visible window instead of being measured at max-content.
-const SIDEBAR_LIST_MAX_VISIBLE_ROWS: usize = 12;
+/// Rows an expanded section keeps when several sections compete for the same
+/// vertical space. A section whose content is shorter than this keeps its
+/// content height instead.
+const SIDEBAR_LIST_MIN_VISIBLE_ROWS: f32 = 3.0;
+/// Viewport height assumed on the first frame, before the bounds tracker has
+/// measured the panel.
+const SIDEBAR_UNMEASURED_VIEWPORT_HEIGHT: f32 = 640.0;
+/// Height of the "No tags"/"Working tree clean"-style placeholder rows.
+const SIDEBAR_EMPTY_ROW_HEIGHT: f32 = 28.0;
+/// Height of the branch filter input row.
+const SIDEBAR_FILTER_ROW_HEIGHT: f32 = 24.0;
+/// Height of the rule between the ref sections and the file-change sections:
+/// a 1px line plus 4px of margin above and below.
+const SIDEBAR_SEPARATOR_HEIGHT: f32 = 9.0;
 
-fn bounded_sidebar_list_height(item_count: usize, row_height: f32) -> f32 {
-    item_count.min(SIDEBAR_LIST_MAX_VISIBLE_ROWS) as f32 * row_height
+/// Heights of the virtualized section lists, in render order.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct SidebarListHeights {
+    local_branches: f32,
+    remotes: f32,
+    remote_branches: f32,
+    tags: f32,
+    stashes: f32,
+    worktrees: f32,
+    staged: f32,
+    unstaged: f32,
+}
+
+/// Splits `available_px` of list space across the expanded sidebar sections.
+///
+/// `desired_px` holds each list's content height (rows × row height) in render
+/// order; a collapsed or empty section contributes `0.0` and stays at zero.
+/// When everything fits, every list keeps its content height. Otherwise lists
+/// that want less than an equal share keep their content height and release the
+/// rest, repeatedly, until the lists still over their share split what is left —
+/// never below `min_px`, so a tall section always keeps a usable viewport even
+/// when many sections are open at once.
+fn distribute_sidebar_list_heights(available_px: f32, desired_px: &[f32], min_px: f32) -> Vec<f32> {
+    let mut heights = desired_px.to_vec();
+    let total: f32 = desired_px.iter().sum();
+    if total <= available_px {
+        return heights;
+    }
+
+    let available = available_px.max(0.0);
+    let mut content_sized = vec![false; desired_px.len()];
+    loop {
+        let flexible: Vec<usize> = (0..desired_px.len())
+            .filter(|i| !content_sized[*i] && desired_px[*i] > 0.0)
+            .collect();
+        if flexible.is_empty() {
+            break;
+        }
+
+        let taken: f32 = (0..desired_px.len())
+            .filter(|i| content_sized[*i])
+            .map(|i| heights[i])
+            .sum();
+        let share = ((available - taken) / flexible.len() as f32).max(min_px);
+
+        let fitting: Vec<usize> = flexible
+            .iter()
+            .copied()
+            .filter(|i| desired_px[*i] <= share)
+            .collect();
+        if fitting.is_empty() {
+            for i in flexible {
+                heights[i] = share;
+            }
+            break;
+        }
+        for i in fitting {
+            content_sized[i] = true;
+        }
+    }
+
+    heights
 }
 
 /// Total rendered size of the stash context menu. Derived from the item count and
@@ -1279,6 +1349,95 @@ impl Sidebar {
                 .map(Self::file_tree_file_count)
                 .sum::<usize>()
     }
+
+    /// Height of everything in the sidebar that is not a virtualized list:
+    /// the repo header, the eight section headers, the branch filter row, the
+    /// placeholder rows of expanded-but-empty sections, and the separator.
+    fn chrome_height(&self, item_h: f32, header_h: f32) -> f32 {
+        let mut chrome = header_h + 8.0 * item_h + SIDEBAR_SEPARATOR_HEIGHT;
+
+        if self.branch_filter_active || !self.branch_filter.is_empty() {
+            chrome += SIDEBAR_FILTER_ROW_HEIGHT;
+        }
+
+        let placeholders = [
+            (
+                SidebarSection::LocalBranches,
+                self.flattened_local_branches.is_empty(),
+            ),
+            (SidebarSection::Remotes, self.remotes.is_empty()),
+            (SidebarSection::Tags, self.tags.is_empty()),
+            (SidebarSection::Stashes, self.stashes.is_empty()),
+            (SidebarSection::Worktrees, self.worktrees.is_empty()),
+            (SidebarSection::StagedChanges, self.staged.is_empty()),
+            (SidebarSection::UnstagedChanges, self.unstaged.is_empty()),
+        ];
+        for (section, is_empty) in placeholders {
+            if is_empty && self.is_expanded(section) {
+                chrome += SIDEBAR_EMPTY_ROW_HEIGHT;
+            }
+        }
+
+        chrome
+    }
+
+    /// Sizes every expanded section list so the sections together fill the
+    /// sidebar viewport. Without this the last expanded section would stop at a
+    /// fixed row count and leave dead space below it, hiding rows that are only
+    /// reachable by scrolling inside the section.
+    fn plan_list_heights(&self, item_h: f32, header_h: f32) -> SidebarListHeights {
+        let rows = |expanded: SidebarSection, count: usize| -> f32 {
+            if self.is_expanded(expanded) {
+                count as f32 * item_h
+            } else {
+                0.0
+            }
+        };
+
+        let desired = [
+            rows(
+                SidebarSection::LocalBranches,
+                self.flattened_local_branches.len(),
+            ),
+            rows(SidebarSection::Remotes, self.flattened_remotes.len()),
+            rows(
+                SidebarSection::RemoteBranches,
+                self.flattened_remote_branches.len(),
+            ),
+            rows(SidebarSection::Tags, self.flattened_tags.len()),
+            rows(SidebarSection::Stashes, self.stashes.len()),
+            rows(SidebarSection::Worktrees, self.flattened_worktrees.len()),
+            rows(SidebarSection::StagedChanges, self.flattened_staged.len()),
+            rows(
+                SidebarSection::UnstagedChanges,
+                self.flattened_unstaged.len(),
+            ),
+        ];
+
+        let viewport = f32::from(self.container_bounds.size.height);
+        let viewport = if viewport > 0.0 {
+            viewport
+        } else {
+            SIDEBAR_UNMEASURED_VIEWPORT_HEIGHT
+        };
+        let available = viewport - self.chrome_height(item_h, header_h);
+        let heights = distribute_sidebar_list_heights(
+            available,
+            &desired,
+            SIDEBAR_LIST_MIN_VISIBLE_ROWS * item_h,
+        );
+
+        SidebarListHeights {
+            local_branches: heights[0],
+            remotes: heights[1],
+            remote_branches: heights[2],
+            tags: heights[3],
+            stashes: heights[4],
+            worktrees: heights[5],
+            staged: heights[6],
+            unstaged: heights[7],
+        }
+    }
 }
 
 impl Render for Sidebar {
@@ -1291,6 +1450,7 @@ impl Render for Sidebar {
         let compactness = cx.global::<SettingsState>().settings().compactness;
         let item_h = compactness.spacing(24.0);
         let header_h = compactness.spacing(26.0);
+        let list_heights = self.plan_list_heights(item_h, header_h);
         let sidebar_weak: WeakEntity<Sidebar> = cx.weak_entity();
 
         // Compute navigable items for keyboard highlight matching
@@ -1303,8 +1463,13 @@ impl Render for Sidebar {
                 let sidebar_bounds = sidebar_bounds.clone();
                 move |bounds: Bounds<Pixels>, _: &mut Window, cx: &mut App| {
                     sidebar_bounds
-                        .update(cx, |this: &mut Sidebar, _| {
-                            this.container_bounds = bounds;
+                        .update(cx, |this: &mut Sidebar, cx| {
+                            if this.container_bounds != bounds {
+                                this.container_bounds = bounds;
+                                // Section list heights are derived from the panel
+                                // height, so a resize needs another frame.
+                                cx.notify();
+                            }
                         })
                         .ok();
                 }
@@ -1564,7 +1729,7 @@ impl Render for Sidebar {
             let nav_base = nav_idx;
             nav_idx += self.flattened_local_branches.len();
             let flattened = self.flattened_local_branches.clone();
-            let list_height = bounded_sidebar_list_height(flattened.len(), item_h);
+            let list_height = list_heights.local_branches;
             let branches = self.local_branches.clone();
             let w = Rc::new(sidebar_weak.clone());
             let colors = colors.clone();
@@ -1912,7 +2077,7 @@ impl Render for Sidebar {
                 );
             } else {
                 let flattened = self.flattened_remotes.clone();
-                let list_height = bounded_sidebar_list_height(flattened.len(), item_h);
+                let list_height = list_heights.remotes;
                 let nav_base = nav_idx;
                 nav_idx += flattened.len();
                 let remotes_list = self.remotes.clone();
@@ -2156,7 +2321,7 @@ impl Render for Sidebar {
             let nav_base = nav_idx;
             nav_idx += self.flattened_remote_branches.len();
             let flattened = self.flattened_remote_branches.clone();
-            let list_height = bounded_sidebar_list_height(flattened.len(), item_h);
+            let list_height = list_heights.remote_branches;
             let remote_branches = self.remote_branches.clone();
             let w = Rc::new(sidebar_weak.clone());
             let colors = colors.clone();
@@ -2320,11 +2485,9 @@ impl Render for Sidebar {
             // Virtualized tags list
             let nav_base = nav_idx;
             nav_idx += self.flattened_tags.len();
-            if self.flattened_tags.is_empty() {
-                // Empty state already rendered above
-            } else {
+            if !self.flattened_tags.is_empty() {
                 let flattened = self.flattened_tags.clone();
-                let list_height = bounded_sidebar_list_height(flattened.len(), item_h);
+                let list_height = list_heights.tags;
                 let tags = self.tags.clone();
                 let selected_tag = self.selected_tag.clone();
                 let colors = colors.clone();
@@ -2545,7 +2708,7 @@ impl Render for Sidebar {
                 let nav_base = nav_idx;
                 nav_idx += self.stashes.len();
                 let stashes = self.stashes.clone();
-                let list_height = bounded_sidebar_list_height(stashes.len(), item_h);
+                let list_height = list_heights.stashes;
                 let selected_stash = self.selected_stash;
                 let colors = colors.clone();
                 let w = sidebar_weak.clone();
@@ -2837,7 +3000,7 @@ impl Render for Sidebar {
                 let nav_base = nav_idx;
                 nav_idx += self.flattened_worktrees.len();
                 let flattened = self.flattened_worktrees.clone();
-                let list_height = bounded_sidebar_list_height(flattened.len(), item_h);
+                let list_height = list_heights.worktrees;
                 let worktrees = self.worktrees.clone();
                 let selected_worktree = self.selected_worktree;
                 let colors = colors.clone();
@@ -3107,7 +3270,7 @@ impl Render for Sidebar {
                 let nav_base = nav_idx;
                 nav_idx += self.flattened_staged.len();
                 let flattened = self.flattened_staged.clone();
-                let list_height = bounded_sidebar_list_height(flattened.len(), item_h);
+                let list_height = list_heights.staged;
                 let files = self.staged.clone();
                 let selected_file = self.selected_file.clone();
                 let w = Rc::new(sidebar_weak.clone());
@@ -3437,7 +3600,7 @@ impl Render for Sidebar {
             } else {
                 let nav_base = unstaged_nav_base;
                 let flattened = self.flattened_unstaged.clone();
-                let list_height = bounded_sidebar_list_height(flattened.len(), item_h);
+                let list_height = list_heights.unstaged;
                 let files = self.unstaged.clone();
                 let selected_file = self.selected_file.clone();
                 let w = sidebar_weak.clone();
@@ -3879,16 +4042,43 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn bounded_list_height_sizes_short_lists_to_content() {
-        assert_eq!(bounded_sidebar_list_height(3, 24.0), 72.0);
+    fn list_heights_stay_content_sized_when_everything_fits() {
+        let heights = distribute_sidebar_list_heights(500.0, &[72.0, 0.0, 120.0], 72.0);
+        assert_eq!(heights, vec![72.0, 0.0, 120.0]);
     }
 
     #[test]
-    fn bounded_list_height_caps_large_lists() {
-        assert_eq!(
-            bounded_sidebar_list_height(SIDEBAR_LIST_MAX_VISIBLE_ROWS + 50, 24.0),
-            SIDEBAR_LIST_MAX_VISIBLE_ROWS as f32 * 24.0
-        );
+    fn a_single_long_list_fills_the_available_space() {
+        let heights = distribute_sidebar_list_heights(400.0, &[0.0, 14040.0, 0.0], 72.0);
+        assert_eq!(heights, vec![0.0, 400.0, 0.0]);
+    }
+
+    #[test]
+    fn short_lists_keep_their_content_height_and_release_the_rest() {
+        // 48px of content plus a list that wants far more: the short list keeps
+        // its two rows and the long one takes everything that is left.
+        let heights = distribute_sidebar_list_heights(400.0, &[48.0, 4800.0], 72.0);
+        assert_eq!(heights, vec![48.0, 352.0]);
+    }
+
+    #[test]
+    fn competing_long_lists_split_the_space_evenly() {
+        let heights = distribute_sidebar_list_heights(400.0, &[4800.0, 4800.0], 72.0);
+        assert_eq!(heights, vec![200.0, 200.0]);
+    }
+
+    #[test]
+    fn every_list_keeps_a_usable_viewport_when_space_runs_out() {
+        // Six tall sections in a short sidebar: each keeps the minimum viewport
+        // and the sidebar itself scrolls.
+        let heights = distribute_sidebar_list_heights(120.0, &[4800.0; 6], 72.0);
+        assert_eq!(heights, vec![72.0; 6]);
+    }
+
+    #[test]
+    fn collapsed_sections_are_left_at_zero() {
+        let heights = distribute_sidebar_list_heights(100.0, &[0.0, 0.0, 4800.0], 72.0);
+        assert_eq!(heights, vec![0.0, 0.0, 100.0]);
     }
 
     // --- file_change_symbol tests ---
