@@ -16,7 +16,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # Pre-flight: resolve version + run the same quality gates as ci.yml so a
@@ -30,7 +29,7 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: Checkout rgitui
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -121,7 +120,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout rgitui
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -168,7 +167,7 @@ jobs:
           Write-Host "Installer built: $expected"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-release
           if-no-files-found: error
@@ -182,7 +181,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout rgitui
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -283,7 +282,7 @@ jobs:
           ls -la rgitui-*.tar.gz rgitui-*.AppImage
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-release
           if-no-files-found: error
@@ -298,7 +297,7 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout rgitui
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -329,7 +328,7 @@ jobs:
           ls -la "$DMG"
 
       - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-release
           if-no-files-found: error
@@ -341,12 +340,12 @@ jobs:
     needs: [preflight, build-windows, build-linux, build-macos]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -405,7 +404,7 @@ jobs:
 
       - name: Create GitHub Release (with CHANGELOG notes)
         if: steps.notes.outputs.has_notes == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           name: rgitui ${{ needs.preflight.outputs.tag }}
@@ -418,7 +417,7 @@ jobs:
 
       - name: Create GitHub Release (auto-generated notes)
         if: steps.notes.outputs.has_notes != 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           name: rgitui ${{ needs.preflight.outputs.tag }}
