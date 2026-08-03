@@ -4,6 +4,7 @@ use gpui::{AsyncApp, Context, Task, WeakEntity};
 
 use crate::types::*;
 
+use super::argsafe::sh_quote;
 use super::ensure_clean_worktree;
 use super::refresh::gather_refresh_data;
 use super::{GitProject, GitProjectEvent, RefreshData};
@@ -13,8 +14,9 @@ impl GitProject {
     ///
     /// Writes the desired todo list to a temp file and invokes `git rebase -i`
     /// with `GIT_SEQUENCE_EDITOR` set to a command that replaces the editor file
-    /// with the prepared plan. For reword actions, uses `exec git commit --amend`
-    /// lines after the pick.
+    /// with the prepared plan. For reword actions, the new message is written to
+    /// its own file and applied with `exec git commit --amend --file`, keeping
+    /// the message off the shell-interpreted `exec` line.
     pub fn rebase_interactive(
         &mut self,
         entries: Vec<RebasePlanEntry>,
@@ -82,8 +84,15 @@ impl GitProject {
                         base.to_string()
                     };
 
+                    // Holds the todo list and any reword message files. Dropped
+                    // once `git rebase` has exited.
+                    let scratch = tempfile::Builder::new()
+                        .prefix("rgitui-rebase-")
+                        .tempdir()
+                        .context("Failed to create a temporary directory for the rebase plan")?;
+
                     let mut todo_lines = Vec::new();
-                    for entry in entries.iter().rev() {
+                    for (index, entry) in entries.iter().rev().enumerate() {
                         let short_oid = if entry.oid.len() >= 7 {
                             &entry.oid[..7]
                         } else {
@@ -96,9 +105,17 @@ impl GitProject {
                             }
                             RebaseEntryAction::Reword(new_msg) => {
                                 todo_lines.push(format!("pick {} {}", short_oid, entry.message));
-                                let escaped = new_msg.replace('\\', "\\\\").replace('"', "\\\"");
-                                todo_lines
-                                    .push(format!("exec git commit --amend -m \"{}\"", escaped));
+                                // Git runs `exec` lines through the shell, so the
+                                // message must never appear on the command line.
+                                // Write it to a file and let git read it verbatim.
+                                let msg_path = scratch.path().join(format!("reword-{index}.msg"));
+                                std::fs::write(&msg_path, new_msg.as_bytes()).with_context(
+                                    || format!("Failed to write reword message for {short_oid}"),
+                                )?;
+                                todo_lines.push(format!(
+                                    "exec git commit --amend --file {}",
+                                    sh_quote(&msg_path.to_string_lossy())
+                                ));
                             }
                             RebaseEntryAction::Squash => {
                                 todo_lines.push(format!("squash {} {}", short_oid, entry.message));
@@ -114,10 +131,9 @@ impl GitProject {
 
                     let todo_content = todo_lines.join("\n") + "\n";
 
-                    let temp_dir = std::env::temp_dir();
-                    let todo_file =
-                        temp_dir.join(format!("rgitui_rebase_todo_{}", std::process::id()));
-                    std::fs::write(&todo_file, &todo_content)?;
+                    let todo_file = scratch.path().join("git-rebase-todo");
+                    std::fs::write(&todo_file, &todo_content)
+                        .context("Failed to write the rebase plan")?;
 
                     let sequence_editor = if cfg!(windows) {
                         format!(
@@ -125,7 +141,7 @@ impl GitProject {
                             todo_file.to_string_lossy().replace('/', "\\")
                         )
                     } else {
-                        format!("cp \"{}\" ", todo_file.to_string_lossy())
+                        format!("cp {} ", sh_quote(&todo_file.to_string_lossy()))
                     };
 
                     let mut cmd = super::git_command();
@@ -137,8 +153,27 @@ impl GitProject {
                         .output()
                         .with_context(|| "Failed to execute git rebase -i")?;
 
-                    if let Err(e) = std::fs::remove_file(&todo_file) {
-                        log::warn!("Failed to clean up rebase todo file: {}", e);
+                    // A rebase that stopped on a conflict is still in progress,
+                    // and its todo list still holds `exec ... --file <path>`
+                    // lines pointing into the scratch directory. Deleting it now
+                    // would make `git rebase --continue` fail to read the reword
+                    // message. Keep the directory in that case and let the OS
+                    // temp sweep reclaim it; otherwise git is done with it.
+                    let rebase_still_in_progress = !output.status.success()
+                        && Repository::open(&repo_path)
+                            .map(|repo| {
+                                matches!(
+                                    repo.state(),
+                                    git2::RepositoryState::Rebase
+                                        | git2::RepositoryState::RebaseInteractive
+                                        | git2::RepositoryState::RebaseMerge
+                                )
+                            })
+                            .unwrap_or(false);
+                    if rebase_still_in_progress {
+                        let _ = scratch.keep();
+                    } else {
+                        drop(scratch);
                     }
 
                     let stdout = String::from_utf8_lossy(&output.stdout);
