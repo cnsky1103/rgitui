@@ -1,12 +1,13 @@
 use gpui::prelude::*;
-use gpui::{
-    div, px, ClickEvent, Context, Entity, EventEmitter, FocusHandle, KeyDownEvent, Render, Window,
-};
+use gpui::{div, px, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Render, Window};
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
     Button, ButtonSize, ButtonStyle, Icon, IconName, IconSize, Label, LabelSize, TextInput,
     TextInputEvent, TintColor,
 };
+
+use crate::keymap;
+use crate::CommandId;
 
 /// Events emitted by the worktree creation dialog.
 #[derive(Debug, Clone)]
@@ -26,6 +27,11 @@ pub struct WorktreeDialog {
     branch_editor: Entity<TextInput>,
     error_message: Option<String>,
     visible: bool,
+    /// Set when the dialog is opened without a `Window`, so the next render can
+    /// take focus. Without it the dialog never enters the focus path, and gpui
+    /// dispatches actions — including `menu::Cancel` — only along that path, so
+    /// Esc would not dismiss it.
+    pending_focus: bool,
     focus_handle: FocusHandle,
 }
 
@@ -87,6 +93,7 @@ impl WorktreeDialog {
             branch_editor,
             error_message: None,
             visible: false,
+            pending_focus: false,
             focus_handle,
         }
     }
@@ -105,9 +112,10 @@ impl WorktreeDialog {
         cx.notify();
     }
 
-    /// Show the dialog without focusing.
+    /// Show the dialog, taking focus on the next render.
     pub fn show_visible(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
         self.visible = true;
+        self.pending_focus = true;
         self.name_editor.update(cx, |e, cx| e.clear(cx));
         self.path_editor.update(cx, |e, cx| e.clear(cx));
         self.branch_editor.update(cx, |e, cx| e.clear(cx));
@@ -188,25 +196,30 @@ impl WorktreeDialog {
         cx.notify();
     }
 
-    fn handle_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.keystroke.key.as_str() == "escape" {
-            self.dismiss(cx);
+    /// Runs a keyboard command scoped to `WorktreeDialog`.
+    ///
+    /// Enter is not handled here: it is propagated so the focused field's own
+    /// submission fires exactly once.
+    fn dispatch_command(&mut self, cmd: CommandId, _window: &mut Window, cx: &mut Context<Self>) {
+        match cmd {
+            CommandId::Cancel => self.dismiss(cx),
+            _ => cx.propagate(),
         }
     }
 }
 
 impl Render for WorktreeDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.visible {
             return div().id("worktree-dialog").into_any_element();
         }
 
-        let colors = cx.colors();
+        if self.pending_focus {
+            self.pending_focus = false;
+            self.name_editor.update(cx, |e, cx| e.focus(window, cx));
+        }
+
+        let colors = cx.colors().clone();
         let name_text = self.name_editor.read(cx).text().to_string();
         let path_text = self.path_editor.read(cx).text().to_string();
         let has_error = self.error_message.is_some();
@@ -221,7 +234,9 @@ impl Render for WorktreeDialog {
         let mut modal = div()
             .id("worktree-dialog-modal")
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::handle_key_down))
+            .map(|el| {
+                keymap::bind_actions(el, "WorktreeDialog", &["Menu"], cx, Self::dispatch_command)
+            })
             .v_flex()
             .w(px(480.))
             .elevation_3(cx)

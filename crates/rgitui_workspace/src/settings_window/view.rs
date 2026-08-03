@@ -31,6 +31,24 @@ use rgitui_ui::{
 use super::events::SettingsViewEvent;
 use super::{SettingsWindowAction, SettingsWindowActionGlobal};
 use crate::github_device_flow::{self, DeviceFlowStatus};
+use crate::CommandId;
+
+/// The commands the General section shows a keystroke for.
+///
+/// Only the command *ids* are listed — the label is the command's doc comment and
+/// the keystroke comes from the keymap, so this cannot drift from what the keys
+/// actually do. It is a short list on purpose; the full reference lives in the
+/// workspace's shortcut panel.
+const QUICK_REFERENCE_COMMANDS: &[CommandId] = &[
+    CommandId::CommandPalette,
+    CommandId::Search,
+    CommandId::StageAll,
+    CommandId::UnstageAll,
+    CommandId::Commit,
+    CommandId::OpenRepo,
+    CommandId::Refresh,
+    CommandId::Settings,
+];
 
 /// Which section of the settings is currently active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3846,29 +3864,23 @@ impl SettingsView {
         section = section.child(tools_card);
         section = section.child(Self::section_divider(cx));
 
-        // Keyboard shortcuts info card
+        // Keyboard shortcuts quick reference, read from the keymap in force so
+        // it follows the user's keymap.json instead of quoting a default.
         let mut shortcuts_card = Self::setting_card(cx);
-        shortcuts_card = shortcuts_card.child(
-            div()
-                .v_flex()
-                .gap(px(8.))
-                .child(Self::setting_label(
-                    "Keyboard Shortcuts",
-                    "Quick reference for common actions.",
-                ))
-                .child(self.render_shortcut_row("Command Palette", "Ctrl+Shift+P", cx))
-                .child(self.render_shortcut_row("Search Commits", "Ctrl+F", cx))
-                .child(self.render_shortcut_row("Stage All", "Ctrl+S", cx))
-                .child(self.render_shortcut_row("Unstage All", "Ctrl+Shift+S", cx))
-                .child(self.render_shortcut_row("Commit", "Ctrl+Enter (in message)", cx))
-                .child(self.render_shortcut_row("Open Repository", "Ctrl+O", cx))
-                .child(self.render_shortcut_row("Refresh", "F5", cx))
-                .child(self.render_shortcut_row("Settings", "Ctrl+,", cx)),
-        );
+        let mut shortcuts_list = div().v_flex().gap(px(8.)).child(Self::setting_label(
+            "Keyboard Shortcuts",
+            "The bindings in force for a few common actions. Open the full \
+             reference from the workspace for all of them.",
+        ));
+        for id in QUICK_REFERENCE_COMMANDS {
+            shortcuts_list = shortcuts_list.child(self.render_shortcut_row(*id, cx));
+        }
+        shortcuts_list = shortcuts_list.child(Self::keymap_file_row(cx));
+        shortcuts_card = shortcuts_card.child(shortcuts_list);
         section = section.child(shortcuts_card);
         section = section.child(Self::section_divider(cx));
 
-        let config_path = config_dir().join("settings.json");
+        let config_path = rgitui_settings::settings_path();
         let config_path_display = config_path.display().to_string();
         let config_dir_path = config_dir();
         let mut config_card = Self::setting_card(cx);
@@ -3926,24 +3938,43 @@ impl SettingsView {
         section
     }
 
-    fn render_shortcut_row(
-        &self,
-        action: &str,
-        shortcut: &str,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
+    /// One quick-reference row: the command's description and the keystroke the
+    /// keymap currently binds it to.
+    ///
+    /// A binding the user defined is tinted and labelled, matching the badge in
+    /// the full shortcut reference.
+    fn render_shortcut_row(&self, id: CommandId, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.colors();
+        let summary = crate::keymap::summary(cx);
+        let is_user_defined = summary.is_user_defined(id);
+        let shortcut = summary
+            .display(id)
+            .unwrap_or_else(|| crate::keymap::display::UNBOUND.to_owned());
+        let color = if is_user_defined {
+            Color::Info
+        } else {
+            Color::Muted
+        };
+
         div()
             .h_flex()
             .w_full()
             .items_center()
+            .gap(px(6.))
             .py(px(4.))
             .child(
-                Label::new(SharedString::from(action.to_string()))
+                Label::new(SharedString::from(id.description()))
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
             .child(div().flex_1())
+            .when(is_user_defined, |row| {
+                row.child(
+                    Label::new("keymap.json")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Info),
+                )
+            })
             .child(
                 div()
                     .h_flex()
@@ -3953,10 +3984,52 @@ impl SettingsView {
                     .bg(colors.hint_background)
                     .items_center()
                     .child(
-                        Label::new(SharedString::from(shortcut.to_string()))
+                        Label::new(SharedString::from(shortcut))
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted)
+                            .color(color)
                             .weight(FontWeight::SEMIBOLD),
+                    ),
+            )
+    }
+
+    /// The `keymap.json` path plus a button that opens it, creating the file with
+    /// a commented starter when it does not exist yet.
+    fn keymap_file_row(cx: &Context<Self>) -> impl IntoElement {
+        let path = crate::keymap::keymap_path();
+        let path_display = path.display().to_string();
+        let editor_command = cx
+            .try_global::<SettingsState>()
+            .map(|state| state.settings().editor_command.clone())
+            .unwrap_or_default();
+
+        div()
+            .h_flex()
+            .w_full()
+            .items_center()
+            .gap(px(8.))
+            .pt(px(8.))
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(SharedString::from(path_display))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(
+                Button::new("open-keymap-file", "Edit keymap.json")
+                    .style(ButtonStyle::Subtle)
+                    .size(ButtonSize::Compact)
+                    .icon(IconName::Settings)
+                    .on_click(
+                        move |_: &ClickEvent, _, _cx| match crate::keymap::ensure_keymap_file() {
+                            Ok(path) => {
+                                crate::workspace::open_editor(&path, &editor_command);
+                            }
+                            Err(error) => log::error!(
+                                "keymap: could not create {}: {error}",
+                                crate::keymap::keymap_path().display()
+                            ),
+                        },
                     ),
             )
     }

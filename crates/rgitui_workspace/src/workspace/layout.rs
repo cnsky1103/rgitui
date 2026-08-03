@@ -10,12 +10,22 @@ use rgitui_ui::{
     Spinner, SpinnerSize, Tab, TabBar, Tooltip,
 };
 
+use crate::keymap;
 use crate::{CommandId, StatusBar, TitleBar, ToastKind};
 
 use super::{
     BottomPanelMode, CommitInputResize, DetailPanelResize, DiffViewerResize, RightPanelMode,
     SidebarResize, ViewAvailability, Workspace,
 };
+
+/// Key context identifier for the workspace root.
+///
+/// Global bindings are scoped to it (see `commands!` in
+/// [`crate::keymap::registry`]); `WORKSPACE_MODAL_KEY_CONTEXT` adds `modal` so
+/// `Workspace && !modal` bindings stand down while an overlay is up.
+const WORKSPACE_KEY_CONTEXT: &str = "Workspace";
+/// Key context for the workspace root while an overlay or dialog is open.
+const WORKSPACE_MODAL_KEY_CONTEXT: &str = "Workspace modal";
 
 /// Resize bounds for the right detail panel, shared by the drag handle and the
 /// Ctrl+[ / Ctrl+] keyboard shortcuts so both input paths clamp identically.
@@ -45,6 +55,15 @@ const BASELINE_REM_SIZE: f32 = 16.0;
 const MIN_UI_FONT_SIZE: u32 = 8;
 const MAX_UI_FONT_SIZE: u32 = 24;
 
+/// The commands the home screen offers a keystroke for. Only the ids are listed:
+/// the label and the keystroke both come from the keymap.
+const WELCOME_SHORTCUTS: &[CommandId] = &[
+    CommandId::OpenRepo,
+    CommandId::WorkspaceHome,
+    CommandId::CommandPalette,
+    CommandId::Settings,
+];
+
 impl Workspace {
     /// Translate the configured base font size into a window rem size.
     ///
@@ -56,6 +75,55 @@ impl Workspace {
     pub(super) fn rem_size_for_font_size(font_size: u32) -> gpui::Pixels {
         let clamped = font_size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE);
         px(clamped as f32 * BASELINE_REM_SIZE / DEFAULT_UI_FONT_SIZE as f32)
+    }
+
+    /// Key context for the workspace root element.
+    ///
+    /// `modal` is added while any overlay or dialog is open. Deriving it here
+    /// rather than from the overlays' own contexts means `!modal` holds even for
+    /// dialogs that do not take focus, matching the old `any_overlay_active`
+    /// gate exactly.
+    fn workspace_key_context(&self, cx: &Context<Self>) -> &'static str {
+        if self.any_overlay_active(cx) {
+            WORKSPACE_MODAL_KEY_CONTEXT
+        } else {
+            WORKSPACE_KEY_CONTEXT
+        }
+    }
+
+    /// The workspace root element, carrying the `Workspace` key context and one
+    /// `on_action` handler per command in the `Workspace`, `GraphView` and
+    /// `DiffViewer` blocks of `commands!`.
+    ///
+    /// Being on the root means the handlers are in the dispatch path of whatever
+    /// child holds focus, so a global shortcut works from any panel. The last two
+    /// blocks are bound here rather than on those views' own elements because
+    /// they live in crates that cannot name the generated actions (see
+    /// [`crate::keymap::registry`]); their bindings are still scoped to the
+    /// `GraphView` and `DiffViewer` key contexts, so they only fire when those
+    /// panels hold focus.
+    fn workspace_root(
+        &self,
+        cx: &mut Context<Self>,
+        ui_font: gpui::Font,
+        background: gpui::Hsla,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut root = div()
+            .id("workspace-root")
+            .key_context(self.workspace_key_context(cx))
+            .size_full()
+            .font(ui_font)
+            .bg(background);
+
+        root = keymap::attach_actions(root, "Workspace", cx, |workspace, cmd, window, cx| {
+            workspace.dispatch_command(cmd, window, cx);
+        });
+        root = keymap::attach_actions(root, "GraphView", cx, |workspace, cmd, window, cx| {
+            workspace.dispatch_graph_command(cmd, window, cx);
+        });
+        keymap::attach_actions(root, "DiffViewer", cx, |workspace, cmd, window, cx| {
+            workspace.dispatch_diff_command(cmd, window, cx);
+        })
     }
 }
 
@@ -113,12 +181,8 @@ impl Render for Workspace {
 
         // If no tabs, show welcome screen
         if self.tabs.is_empty() {
-            return div()
-                .id("workspace-root")
-                .size_full()
-                .font(ui_font.clone())
-                .bg(colors.background)
-                .on_key_down(cx.listener(Self::handle_key_down))
+            let root = self.workspace_root(cx, ui_font.clone(), colors.background);
+            return root
                 .child(self.render_welcome_interactive(cx))
                 .child(self.toast_layer.clone())
                 .child(self.overlays.command_palette.clone())
@@ -406,13 +470,9 @@ impl Render for Workspace {
         let operation_output_bar = self.render_operation_output_bar(cx);
         let update_banner = self.render_update_banner(cx);
 
-        div()
-            .id("workspace-root")
-            .v_flex()
-            .size_full()
-            .font(ui_font)
-            .bg(colors.background)
-            .on_key_down(cx.listener(Self::handle_key_down))
+        let root = self.workspace_root(cx, ui_font, colors.background).v_flex();
+
+        root
             // Title bar
             .child({
                 let sidebar = active_tab.sidebar.clone();
@@ -1667,10 +1727,11 @@ impl Workspace {
                 .mt(px(8.))
                 .w_full()
                 .items_center()
-                .child(self.shortcut_hint("Open Repository", "Ctrl+O", colors))
-                .child(self.shortcut_hint("Go Home", "Ctrl+H", colors))
-                .child(self.shortcut_hint("Command Palette", "Ctrl+Shift+P", colors))
-                .child(self.shortcut_hint("Settings", "Ctrl+,", colors)),
+                .children(
+                    WELCOME_SHORTCUTS
+                        .iter()
+                        .filter_map(|command| self.shortcut_hint(*command, colors, cx)),
+                ),
         );
 
         // Scrollable outer container with an inner wrapper that fills at least
@@ -1696,36 +1757,44 @@ impl Workspace {
             )
     }
 
+    /// One home-screen hint, or nothing when the command has no keystroke.
+    ///
+    /// The label is the command's description and the keystroke comes from the
+    /// keymap, so a rebind in `keymap.json` shows up here too.
     fn shortcut_hint(
         &self,
-        action: &str,
-        shortcut: &str,
+        command: CommandId,
         colors: &rgitui_theme::ThemeColors,
-    ) -> impl IntoElement {
-        div()
-            .h_flex()
-            .w(px(260.))
-            .justify_between()
-            .items_center()
-            .child(
-                Label::new(SharedString::from(action.to_string()))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                div()
-                    .h_flex()
-                    .h(px(22.))
-                    .px(px(8.))
-                    .rounded(px(4.))
-                    .bg(colors.element_background)
-                    .items_center()
-                    .child(
-                        Label::new(SharedString::from(shortcut.to_string()))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
+        cx: &gpui::App,
+    ) -> Option<impl IntoElement> {
+        let shortcut = crate::keymap::shortcut(command, cx)?;
+        let action = command.description();
+        Some(
+            div()
+                .h_flex()
+                .w(px(260.))
+                .justify_between()
+                .items_center()
+                .child(
+                    Label::new(SharedString::from(action.to_string()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .h(px(22.))
+                        .px(px(8.))
+                        .rounded(px(4.))
+                        .bg(colors.element_background)
+                        .items_center()
+                        .child(
+                            Label::new(SharedString::from(shortcut))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                ),
+        )
     }
 
     /// Schedule a debounced layout save (avoids writing to disk on every resize pixel).

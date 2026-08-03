@@ -1,13 +1,241 @@
-use gpui::Context;
+use gpui::{Context, Window};
 
 use crate::{CommandId, CommitPanelEvent, ConfirmAction, ToastKind};
 
+use super::layout::{
+    MAX_DETAIL_PANEL_WIDTH, MAX_DIFF_VIEWER_HEIGHT, MIN_DETAIL_PANEL_WIDTH, MIN_DIFF_VIEWER_HEIGHT,
+};
 use super::{
-    BottomPanelMode, ProjectTab, RightPanelMode, ViewCacheEntry, ViewCacheKey, ViewCaches,
-    Workspace,
+    BottomPanelMode, FocusedPanel, ProjectTab, RightPanelMode, ViewCacheEntry, ViewCacheKey,
+    ViewCaches, Workspace,
 };
 
+/// Pixels the detail panel grows or shrinks by per keystroke.
+const DETAIL_PANEL_STEP: f32 = 20.0;
+/// Pixels the diff viewer grows or shrinks by per keystroke.
+const DIFF_VIEWER_STEP: f32 = 30.0;
+
 impl Workspace {
+    /// Entry point for keyboard-invoked commands.
+    ///
+    /// The generated `on_action` handlers (see [`crate::keymap::attach_actions`])
+    /// all land here. Commands that need a [`Window`] — to move focus or to
+    /// focus an overlay's input — are handled directly; everything else goes to
+    /// [`Self::execute_command`], which is also what the command palette calls.
+    pub(super) fn dispatch_command(
+        &mut self,
+        cmd: CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match cmd {
+            CommandId::CommandPalette => {
+                self.save_focus(window, cx);
+                self.overlays.command_palette.update(cx, |palette, cx| {
+                    palette.toggle(window, cx);
+                });
+            }
+            CommandId::Settings => {
+                self.save_focus(window, cx);
+                self.open_or_focus_settings(cx);
+            }
+            CommandId::OpenRepo => {
+                self.save_focus(window, cx);
+                self.overlays.repo_opener.update(cx, |opener, cx| {
+                    opener.toggle(window, cx);
+                });
+            }
+            CommandId::Shortcuts => {
+                self.save_focus(window, cx);
+                self.overlays.shortcuts_help.update(cx, |help, cx| {
+                    help.toggle(window, cx);
+                });
+            }
+            // Switching branches means focusing the sidebar's branch list.
+            CommandId::SwitchBranch => {
+                self.focus_panel(FocusedPanel::Sidebar, window, cx);
+            }
+            CommandId::FocusSidebar => self.focus_panel(FocusedPanel::Sidebar, window, cx),
+            CommandId::FocusGraph => self.focus_panel(FocusedPanel::Graph, window, cx),
+            CommandId::FocusDetailPanel => self.focus_panel(FocusedPanel::DetailPanel, window, cx),
+            CommandId::FocusDiffViewer => self.focus_panel(FocusedPanel::DiffViewer, window, cx),
+            CommandId::FocusNextPanel => self.focus_next_panel(window, cx),
+            CommandId::FocusPrevPanel => self.focus_prev_panel(window, cx),
+            CommandId::Search => self.toggle_graph_search(window, cx),
+            CommandId::GlobalSearch => self.toggle_global_search(window, cx),
+            cmd => self.execute_command(cmd, cx),
+        }
+    }
+
+    /// Runs a `graph::*` command against the active tab's commit graph.
+    ///
+    /// `GraphView` lives in `rgitui_graph`, which cannot depend on this crate and
+    /// therefore cannot name the actions. The workspace root is an ancestor of
+    /// the graph on every dispatch path, so handling them here still means the
+    /// bindings only fire while the graph holds focus — that is what the
+    /// `GraphView` key context on its root element is for.
+    pub(super) fn dispatch_graph_command(
+        &mut self,
+        cmd: CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(graph) = self.tabs.get(self.active_tab).map(|tab| tab.graph.clone()) else {
+            cx.propagate();
+            return;
+        };
+        // Squashing needs the project, the rebase dialog and the toast queue, so it
+        // is handled on the workspace rather than inside `graph.update`.
+        if cmd == CommandId::SquashSelected {
+            self.squash_selected_commits(cx);
+            return;
+        }
+        graph.update(cx, |graph, cx| match cmd {
+            CommandId::GraphSelectNext => graph.select_next_row(cx),
+            CommandId::GraphSelectPrev => graph.select_prev_row(cx),
+            CommandId::GraphSelectFirst => graph.select_first_row(cx),
+            CommandId::GraphSelectLast => graph.select_last_row(cx),
+            CommandId::GraphExtendSelectionNext => graph.extend_selection_next(cx),
+            CommandId::GraphExtendSelectionPrev => graph.extend_selection_prev(cx),
+            CommandId::GraphCancel => graph.cancel(window, cx),
+            CommandId::CopyCommitSha => graph.copy_selected_sha(cx),
+            CommandId::CopyCommitMessage => graph.copy_selected_message(cx),
+            _ => cx.propagate(),
+        });
+    }
+
+    /// Pre-fills the interactive rebase dialog with a plan that squashes the
+    /// commits selected in the graph into the oldest of them.
+    ///
+    /// Nothing is executed here: the plan goes into the dialog so the user can
+    /// review it, adjust the actions and confirm through the dialog's own
+    /// `Execute` path. Validation happens first — see [`crate::squash`] for why —
+    /// and a rejection becomes a toast that names the condition that failed.
+    ///
+    /// Both routes to squashing end here: the `graph::SquashSelected` keystroke
+    /// and the graph's "Squash selected commits" context-menu item, which only
+    /// checks that two rows are selected before emitting.
+    pub(super) fn squash_selected_commits(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let graph = tab.graph.clone();
+        let project = tab.project.clone();
+        let selected = graph.read(cx).selected_commit_oids();
+
+        let planned = {
+            let proj = project.read(cx);
+            proj.head_oid_at(proj.repo_path()).map(|head_oid| {
+                crate::squash::plan_squash(proj.recent_commits(), head_oid, &selected)
+            })
+        };
+
+        match planned {
+            Some(Ok(plan)) => {
+                self.overlays.interactive_rebase.update(cx, |ir, cx| {
+                    ir.show_visible(
+                        plan.entries,
+                        format!("{} (rebase onto)", plan.base_label),
+                        cx,
+                    );
+                });
+            }
+            Some(Err(rejection)) => {
+                self.show_toast(rejection.message(), ToastKind::Warning, cx);
+            }
+            None => {
+                self.show_toast(
+                    "Could not resolve HEAD, so there is nothing to squash onto. Refresh and \
+                     try again.",
+                    ToastKind::Warning,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Runs a `diff::*` command against the active tab's diff viewer.
+    ///
+    /// Handled here for the same reason as [`Self::dispatch_graph_command`]:
+    /// `rgitui_diff` sits below this crate and cannot name the actions.
+    pub(super) fn dispatch_diff_command(
+        &mut self,
+        cmd: CommandId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diff) = self
+            .tabs
+            .get(self.active_tab)
+            .map(|tab| tab.diff_viewer.clone())
+        else {
+            cx.propagate();
+            return;
+        };
+        diff.update(cx, |diff, cx| match cmd {
+            CommandId::DiffSelectNext => diff.select_next_row(cx),
+            CommandId::DiffSelectPrev => diff.select_prev_row(cx),
+            CommandId::DiffSelectFirst => diff.select_first_row(cx),
+            CommandId::DiffSelectLast => diff.select_last_row(cx),
+            CommandId::NextHunk => diff.select_next_hunk(cx),
+            CommandId::PrevHunk => diff.select_prev_hunk(cx),
+            CommandId::ToggleDiffDisplayMode => diff.toggle_display_mode(cx),
+            CommandId::TogglePartialSelection => diff.toggle_partial_mode(cx),
+            CommandId::StageSelection => diff.stage_selection(cx),
+            CommandId::UnstageSelection => diff.unstage_selection(cx),
+            CommandId::StageCurrentHunk => diff.stage_current_hunk(cx),
+            CommandId::UnstageCurrentHunk => diff.unstage_current_hunk(cx),
+            CommandId::CopyDiffSelection => diff.copy_selection(cx),
+            CommandId::SelectAllDiffLines => diff.select_all_lines(cx),
+            _ => cx.propagate(),
+        });
+    }
+
+    /// Toggles the commit graph's search field, focusing it when it opens.
+    fn toggle_graph_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let graph = tab.graph.clone();
+        graph.update(cx, |graph, cx| {
+            graph.toggle_search_focused(window, cx);
+        });
+    }
+
+    /// Widens (positive `delta`) or narrows the right-hand detail panel.
+    fn resize_detail_panel(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.layout.detail_panel_width = (self.layout.detail_panel_width + delta)
+            .clamp(MIN_DETAIL_PANEL_WIDTH, MAX_DETAIL_PANEL_WIDTH);
+        self.schedule_layout_save(cx);
+        cx.notify();
+    }
+
+    /// Heightens (positive `delta`) or shortens the bottom diff viewer.
+    fn resize_diff_viewer(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.layout.diff_viewer_height = (self.layout.diff_viewer_height + delta)
+            .clamp(MIN_DIFF_VIEWER_HEIGHT, MAX_DIFF_VIEWER_HEIGHT);
+        self.schedule_layout_save(cx);
+        cx.notify();
+    }
+
+    /// Swaps the bottom panel between the diff viewer and the working-tree search.
+    fn toggle_global_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if tab.bottom_panel_mode == BottomPanelMode::GlobalSearch {
+            tab.global_search_view
+                .update(cx, |search, cx| search.hide(cx));
+            tab.bottom_panel_mode = BottomPanelMode::Diff;
+        } else {
+            tab.bottom_panel_mode = BottomPanelMode::GlobalSearch;
+            tab.global_search_view.update(cx, |search, cx| {
+                search.show(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
     pub(super) fn execute_command(&mut self, cmd: CommandId, cx: &mut Context<Self>) {
         match cmd {
             CommandId::Settings => {
@@ -27,6 +255,9 @@ impl Workspace {
                 self.overlays.shortcuts_help.update(cx, |sh, cx| {
                     sh.toggle_visible(cx);
                 });
+            }
+            CommandId::OpenKeymap => {
+                self.open_keymap_file(cx);
             }
             CommandId::WorkspaceHome => {
                 self.go_home(cx);
@@ -74,6 +305,42 @@ impl Workspace {
                     te.show_for_active_theme(cx);
                 });
             }
+            CommandId::NextTab => {
+                if !self.tabs.is_empty() {
+                    self.active_tab = (self.active_tab + 1) % self.tabs.len();
+                    cx.notify();
+                }
+            }
+            CommandId::PrevTab => {
+                if !self.tabs.is_empty() {
+                    self.active_tab = if self.active_tab == 0 {
+                        self.tabs.len() - 1
+                    } else {
+                        self.active_tab - 1
+                    };
+                    cx.notify();
+                }
+            }
+            CommandId::CloseTab => {
+                if !self.tabs.is_empty() {
+                    self.close_tab(self.active_tab, cx);
+                }
+            }
+            CommandId::ShrinkDetailPanel => self.resize_detail_panel(-DETAIL_PANEL_STEP, cx),
+            CommandId::GrowDetailPanel => self.resize_detail_panel(DETAIL_PANEL_STEP, cx),
+            CommandId::ShrinkDiffViewer => self.resize_diff_viewer(-DIFF_VIEWER_STEP, cx),
+            CommandId::GrowDiffViewer => self.resize_diff_viewer(DIFF_VIEWER_STEP, cx),
+            // Toggling the palette needs a `Window`, so it is handled in
+            // `dispatch_command`. It is `[hidden]`, so the palette never
+            // dispatches it to itself. The panel-focus commands likewise need a
+            // `Window` and are `[hidden]`.
+            CommandId::CommandPalette
+            | CommandId::FocusSidebar
+            | CommandId::FocusGraph
+            | CommandId::FocusDetailPanel
+            | CommandId::FocusDiffViewer
+            | CommandId::FocusNextPanel
+            | CommandId::FocusPrevPanel => {}
             cmd => {
                 let Some(tab) = self.tabs.get(self.active_tab).cloned() else {
                     return;
@@ -326,8 +593,11 @@ impl Workspace {
                 self.show_toast(msg, ToastKind::Info, cx);
             }
             CommandId::SwitchBranch => {
+                let hint = crate::keymap::shortcut(CommandId::FocusSidebar, cx)
+                    .map(|keystrokes| format!("Press {keystrokes} to "))
+                    .unwrap_or_else(|| "Use the sidebar to ".to_owned());
                 self.show_toast(
-                    "Press Ctrl+Shift+B or use Alt+1 to focus the sidebar for branch switching",
+                    format!("{hint}focus the sidebar for branch switching"),
                     ToastKind::Info,
                     cx,
                 );
@@ -494,10 +764,83 @@ impl Workspace {
             | CommandId::CreateBranch
             | CommandId::OpenRepo
             | CommandId::Shortcuts
+            | CommandId::OpenKeymap
             | CommandId::WorkspaceHome
             | CommandId::RestoreLastWorkspace
             | CommandId::Undo
-            | CommandId::OpenThemeEditor => {}
+            | CommandId::OpenThemeEditor
+            | CommandId::CommandPalette
+            | CommandId::NextTab
+            | CommandId::PrevTab
+            | CommandId::CloseTab
+            | CommandId::FocusSidebar
+            | CommandId::FocusGraph
+            | CommandId::FocusDetailPanel
+            | CommandId::FocusDiffViewer
+            | CommandId::FocusNextPanel
+            | CommandId::FocusPrevPanel
+            | CommandId::ShrinkDetailPanel
+            | CommandId::GrowDetailPanel
+            | CommandId::ShrinkDiffViewer
+            | CommandId::GrowDiffViewer => {}
+            // View-owned commands. Each is handled by the panel, overlay or
+            // dialog whose key context scopes it — the shared `menu` commands on
+            // whichever element holds the selection, the `graph` and `diff` ones
+            // on the workspace root (see `dispatch_view_command`) because those
+            // two views live in crates that cannot name these actions. They are
+            // listed rather than swept up by a wildcard so that adding a command
+            // forces a decision about where it is handled.
+            CommandId::Cancel
+            | CommandId::Confirm
+            | CommandId::SelectNext
+            | CommandId::SelectPrev
+            | CommandId::SelectFirst
+            | CommandId::SelectLast
+            | CommandId::GraphSelectNext
+            | CommandId::GraphSelectPrev
+            | CommandId::GraphSelectFirst
+            | CommandId::GraphSelectLast
+            | CommandId::GraphExtendSelectionNext
+            | CommandId::GraphExtendSelectionPrev
+            | CommandId::SquashSelected
+            | CommandId::GraphCancel
+            | CommandId::CopyCommitSha
+            | CommandId::CopyCommitMessage
+            | CommandId::DiffSelectNext
+            | CommandId::DiffSelectPrev
+            | CommandId::DiffSelectFirst
+            | CommandId::DiffSelectLast
+            | CommandId::NextHunk
+            | CommandId::PrevHunk
+            | CommandId::ToggleDiffDisplayMode
+            | CommandId::TogglePartialSelection
+            | CommandId::StageSelection
+            | CommandId::UnstageSelection
+            | CommandId::StageCurrentHunk
+            | CommandId::UnstageCurrentHunk
+            | CommandId::CopyDiffSelection
+            | CommandId::SelectAllDiffLines
+            | CommandId::ToggleFileTree
+            | CommandId::PrevCommitDetails
+            | CommandId::NextCommitDetails
+            | CommandId::FileSearch
+            | CommandId::ToggleStageRow
+            | CommandId::DiscardRow
+            | CommandId::FilterBranches
+            | CommandId::BlameShowDiff
+            | CommandId::BlameShowHistory
+            | CommandId::HistoryShowDiff
+            | CommandId::HistoryShowBlame
+            | CommandId::RebaseMoveUp
+            | CommandId::RebaseMoveDown
+            | CommandId::RebasePick
+            | CommandId::RebaseReword
+            | CommandId::RebaseSquash
+            | CommandId::RebaseFixup
+            | CommandId::RebaseDrop
+            | CommandId::ThemeEditorNextField
+            | CommandId::ThemeEditorPrevField
+            | CommandId::SubmitPullRequest => {}
         }
     }
 

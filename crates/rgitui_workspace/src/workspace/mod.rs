@@ -8,6 +8,7 @@ mod tabs;
 mod undo;
 mod update_checker;
 
+pub(crate) use layout::open_editor;
 pub(crate) use state::*;
 pub(crate) use undo::{UndoAction, UndoStack};
 
@@ -278,6 +279,9 @@ pub struct Workspace {
     pub(super) update_notification: Option<UpdateNotification>,
     pub(super) settings_window: Option<WindowHandle<crate::SettingsWindow>>,
     pub(super) _settings_window_closed_subscription: Option<gpui::Subscription>,
+    /// Keeps the [`crate::keymap::KeymapState`] observer alive so `keymap.json`
+    /// reload problems are toasted as they happen.
+    pub(super) _keymap_subscription: gpui::Subscription,
 }
 
 /// Smallest width the left sidebar may take, whether reached by dragging the
@@ -422,6 +426,10 @@ impl Workspace {
             update_notification: None,
             settings_window: None,
             _settings_window_closed_subscription: None,
+            // Fires on every keymap.json reload, including ones long after startup.
+            _keymap_subscription: cx.observe_global::<crate::keymap::KeymapState>(
+                |workspace, cx| workspace.show_keymap_problems(cx),
+            ),
         }
     }
 
@@ -636,6 +644,63 @@ impl Workspace {
                 cx,
             );
         }
+    }
+
+    /// Surface anything wrong with the user's `keymap.json` as a toast.
+    ///
+    /// Drains the problems so each is shown once, whether it came from the
+    /// startup load or from a later reload triggered by saving the file.
+    pub fn show_keymap_problems(&mut self, cx: &mut Context<Self>) {
+        // Read before writing. This runs as a `KeymapState` global observer, and
+        // `update_global` notifies global observers on release — so taking the
+        // problems unconditionally re-enters this method forever, pinning the UI
+        // thread at 100% CPU on startup and on every keymap.json save. Bailing
+        // out when there is nothing left to report ends the cycle after one pass.
+        let has_problems = cx
+            .try_global::<crate::keymap::KeymapState>()
+            .is_some_and(crate::keymap::KeymapState::has_problems);
+        if !has_problems {
+            return;
+        }
+        let problems =
+            cx.update_global::<crate::keymap::KeymapState, _>(|state, _| state.take_problems());
+        for problem in problems {
+            self.show_toast(problem, ToastKind::Error, cx);
+        }
+    }
+
+    /// Open `keymap.json` in the user's editor, creating it first if it does not
+    /// exist yet.
+    ///
+    /// The file is created with a commented starter (see
+    /// [`crate::keymap::keymap_stub`]) rather than left absent, so the editor
+    /// opens on something that explains the format instead of an empty buffer.
+    /// The editor is the one configured in settings, falling back to the same
+    /// detection the rest of the app uses; if none can be launched the path is
+    /// toasted so it can still be found by hand.
+    pub(crate) fn open_keymap_file(&mut self, cx: &mut Context<Self>) {
+        let path = match crate::keymap::ensure_keymap_file() {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_toast(
+                    format!(
+                        "Could not create {}: {error}. Create it by hand to customise \
+                         keybindings.",
+                        crate::keymap::keymap_path().display()
+                    ),
+                    ToastKind::Error,
+                    cx,
+                );
+                return;
+            }
+        };
+
+        let editor_command = cx
+            .try_global::<rgitui_settings::SettingsState>()
+            .map(|settings| settings.settings().editor_command.clone())
+            .unwrap_or_default();
+        layout::open_editor(&path, &editor_command);
+        self.show_toast(format!("Opening {}", path.display()), ToastKind::Info, cx);
     }
 
     /// Mark a clean exit when the user explicitly closes or goes home.

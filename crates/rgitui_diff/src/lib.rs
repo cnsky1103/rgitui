@@ -9,9 +9,9 @@ use similar::{capture_diff_slices, Algorithm};
 use gpui::prelude::*;
 use gpui::{
     div, list, px, uniform_list, AnyElement, App, ClickEvent, ClipboardItem, Context, CursorStyle,
-    ElementId, EventEmitter, FocusHandle, FontStyle, FontWeight, HighlightStyle, KeyDownEvent,
-    ListAlignment, ListHorizontalSizingBehavior, ListSizingBehavior, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, SharedString, StyledText,
+    ElementId, EventEmitter, FocusHandle, FontStyle, FontWeight, HighlightStyle, ListAlignment,
+    ListHorizontalSizingBehavior, ListSizingBehavior, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, SharedString, StyledText,
     UniformListScrollHandle, WeakEntity, Window,
 };
 use rgitui_git::{DiffLine, FileDiff, ThreeWayFileDiff};
@@ -1124,238 +1124,224 @@ impl DiffViewer {
         }
     }
 
-    fn handle_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = event.keystroke.key.as_str();
-        let primary = event.keystroke.modifiers.secondary();
+    /// Moves the diff cursor down one row, scrolling it into view.
+    ///
+    /// The workspace drives this and the methods below from the `diff::*`
+    /// actions: this crate sits below `rgitui_workspace` in the dependency graph
+    /// and so cannot name them.
+    pub fn select_next_row(&mut self, cx: &mut Context<Self>) {
         let row_count = self.row_count();
-
         if row_count == 0 {
             return;
         }
+        let next = match self.highlighted_row {
+            Some(i) if i + 1 < row_count => i + 1,
+            None => 0,
+            Some(i) => i,
+        };
+        self.highlight_row(next, cx);
+    }
 
-        match key {
-            "j" | "down" if !primary => {
-                let next = match self.highlighted_row {
-                    Some(i) if i + 1 < row_count => i + 1,
-                    None => 0,
-                    Some(i) => i,
-                };
-                self.highlighted_row = Some(next);
-                self.scroll_row_into_view(next, cx);
-                cx.notify();
+    /// Moves the diff cursor up one row, scrolling it into view.
+    pub fn select_prev_row(&mut self, cx: &mut Context<Self>) {
+        if self.row_count() == 0 {
+            return;
+        }
+        let next = match self.highlighted_row {
+            Some(i) if i > 0 => i - 1,
+            Some(i) => i,
+            None => 0,
+        };
+        self.highlight_row(next, cx);
+    }
+
+    /// Moves the diff cursor to the first row.
+    pub fn select_first_row(&mut self, cx: &mut Context<Self>) {
+        if self.row_count() > 0 {
+            self.highlight_row(0, cx);
+        }
+    }
+
+    /// Moves the diff cursor to the last row.
+    pub fn select_last_row(&mut self, cx: &mut Context<Self>) {
+        let row_count = self.row_count();
+        if row_count > 0 {
+            self.highlight_row(row_count - 1, cx);
+        }
+    }
+
+    fn highlight_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.highlighted_row = Some(row);
+        self.scroll_row_into_view(row, cx);
+        cx.notify();
+    }
+
+    /// Whether the row at `index` in the current display mode is a hunk header.
+    fn is_hunk_header(&self, index: usize) -> bool {
+        match self.display_mode {
+            DiffDisplayMode::Unified => {
+                matches!(self.display_rows[index], DisplayRow::HunkHeader { .. })
             }
-            "k" | "up" if !primary => {
-                let next = match self.highlighted_row {
-                    Some(i) if i > 0 => i - 1,
-                    None if row_count > 0 => 0,
-                    Some(i) => i,
-                    None => 0,
-                };
-                self.highlighted_row = Some(next);
-                self.scroll_row_into_view(next, cx);
-                cx.notify();
+            DiffDisplayMode::SideBySide => {
+                matches!(self.sbs_rows[index], SideBySideRow::HunkHeader { .. })
             }
-            "g" if !primary && !event.keystroke.modifiers.shift => {
-                self.highlighted_row = Some(0);
-                self.scroll_row_into_view(0, cx);
-                cx.notify();
+            DiffDisplayMode::ThreeWay => {
+                matches!(self.three_way_rows[index], ThreeWayRow::HunkHeader { .. })
             }
-            "g" if event.keystroke.modifiers.shift => {
-                let last = row_count.saturating_sub(1);
-                self.highlighted_row = Some(last);
-                self.scroll_row_into_view(last, cx);
-                cx.notify();
+        }
+    }
+
+    /// Moves the cursor to the next hunk header, wrapping at the end.
+    pub fn select_next_hunk(&mut self, cx: &mut Context<Self>) {
+        let row_count = self.row_count();
+        if row_count == 0 {
+            return;
+        }
+        let start = self.highlighted_row.map(|r| r + 1).unwrap_or(0);
+        let next = (start..row_count)
+            .find(|&i| self.is_hunk_header(i))
+            .or_else(|| (0..start).find(|&i| self.is_hunk_header(i)));
+        if let Some(pos) = next {
+            self.highlight_row(pos, cx);
+        }
+    }
+
+    /// Moves the cursor to the previous hunk header, wrapping at the start.
+    pub fn select_prev_hunk(&mut self, cx: &mut Context<Self>) {
+        let row_count = self.row_count();
+        if row_count == 0 {
+            return;
+        }
+        let end = self.highlighted_row.unwrap_or(row_count);
+        let prev = (0..end)
+            .rev()
+            .find(|&i| self.is_hunk_header(i))
+            .or_else(|| (end..row_count).rev().find(|&i| self.is_hunk_header(i)));
+        if let Some(pos) = prev {
+            self.highlight_row(pos, cx);
+        }
+    }
+
+    /// Toggles line-level selection, clearing any selection when leaving it.
+    pub fn toggle_partial_mode(&mut self, cx: &mut Context<Self>) {
+        // Meaningless for committed or stashed content, which cannot be staged
+        // at all.
+        if self.source.is_historical() {
+            return;
+        }
+        self.partial_mode = !self.partial_mode;
+        if !self.partial_mode {
+            self.selected_lines = None;
+            self.selection_anchor = None;
+        }
+        cx.notify();
+    }
+
+    /// Selects every row in the diff.
+    pub fn select_all_lines(&mut self, cx: &mut Context<Self>) {
+        let row_count = self.row_count();
+        if row_count == 0 {
+            return;
+        }
+        self.selection_anchor = Some(0);
+        self.selected_lines = Some(0..row_count);
+        cx.notify();
+    }
+
+    /// Copies the selected diff lines to the clipboard.
+    pub fn copy_selection(&self, cx: &mut Context<Self>) {
+        self.copy_selected_lines(cx);
+    }
+
+    /// Requests staging of the hunks — or, in partial mode, the individual
+    /// lines — under the current selection, falling back to the cursor's hunk.
+    pub fn stage_selection(&mut self, cx: &mut Context<Self>) {
+        // Only the working tree can be staged; committed and stashed content is
+        // historical and has nothing to stage.
+        if self.source.staging_action() != Some(StagingAction::Stage) {
+            return;
+        }
+        if self.partial_mode {
+            // Line-level staging: emit the selected change lines (additions and
+            // deletions). Each pair carries its old/new line number; the git
+            // layer matches additions on the new side and deletions on the old
+            // side, so deletions must flow through unfiltered.
+            let line_pairs = self.change_lines_under_selection();
+            if !line_pairs.is_empty() {
+                cx.emit(DiffViewerEvent::LineStageRequested(line_pairs));
             }
-            "]" if !primary => {
-                // Jump to next hunk header after current position
-                let start = self.highlighted_row.map(|r| r + 1).unwrap_or(0);
-                let next = match self.display_mode {
-                    DiffDisplayMode::Unified => (start..row_count)
-                        .find(|&i| matches!(self.display_rows[i], DisplayRow::HunkHeader { .. })),
-                    DiffDisplayMode::SideBySide => (start..row_count)
-                        .find(|&i| matches!(self.sbs_rows[i], SideBySideRow::HunkHeader { .. })),
-                    DiffDisplayMode::ThreeWay => (start..row_count).find(|&i| {
-                        matches!(self.three_way_rows[i], ThreeWayRow::HunkHeader { .. })
-                    }),
-                }
-                // Wrap around
-                .or_else(|| match self.display_mode {
-                    DiffDisplayMode::Unified => (0..start)
-                        .find(|&i| matches!(self.display_rows[i], DisplayRow::HunkHeader { .. })),
-                    DiffDisplayMode::SideBySide => (0..start)
-                        .find(|&i| matches!(self.sbs_rows[i], SideBySideRow::HunkHeader { .. })),
-                    DiffDisplayMode::ThreeWay => (0..start).find(|&i| {
-                        matches!(self.three_way_rows[i], ThreeWayRow::HunkHeader { .. })
-                    }),
-                });
-                if let Some(pos) = next {
-                    self.highlighted_row = Some(pos);
-                    self.scroll_row_into_view(pos, cx);
-                    cx.notify();
-                }
-                cx.stop_propagation();
+            // TODO(audit): BUG-15 surface a "no stageable lines" toast when a
+            // partial selection yields nothing — needs a new DiffViewerEvent
+            // variant + a handler arm in rgitui_workspace events.rs (the toast
+            // system lives there), which can't be added from this crate alone.
+            return;
+        }
+        for idx in self.hunks_to_act_on() {
+            cx.emit(DiffViewerEvent::HunkStageRequested(idx));
+        }
+    }
+
+    /// Requests unstaging of the hunks — or lines — under the current selection.
+    pub fn unstage_selection(&mut self, cx: &mut Context<Self>) {
+        // Only the index can be unstaged.
+        if self.source.staging_action() != Some(StagingAction::Unstage) {
+            return;
+        }
+        if self.partial_mode {
+            // Deletions must flow through so the git layer can match them on the
+            // old side; filtering to additions would make unstaging a pure
+            // deletion a silent no-op.
+            let line_pairs = self.change_lines_under_selection();
+            if !line_pairs.is_empty() {
+                cx.emit(DiffViewerEvent::LineUnstageRequested(line_pairs));
             }
-            "[" if !primary => {
-                // Jump to previous hunk header before current position
-                let end = self.highlighted_row.unwrap_or(row_count);
-                let prev = match self.display_mode {
-                    DiffDisplayMode::Unified => (0..end)
-                        .rev()
-                        .find(|&i| matches!(self.display_rows[i], DisplayRow::HunkHeader { .. })),
-                    DiffDisplayMode::SideBySide => (0..end)
-                        .rev()
-                        .find(|&i| matches!(self.sbs_rows[i], SideBySideRow::HunkHeader { .. })),
-                    DiffDisplayMode::ThreeWay => (0..end).rev().find(|&i| {
-                        matches!(self.three_way_rows[i], ThreeWayRow::HunkHeader { .. })
-                    }),
-                }
-                // Wrap around
-                .or_else(|| match self.display_mode {
-                    DiffDisplayMode::Unified => (end..row_count)
-                        .rev()
-                        .find(|&i| matches!(self.display_rows[i], DisplayRow::HunkHeader { .. })),
-                    DiffDisplayMode::SideBySide => (end..row_count)
-                        .rev()
-                        .find(|&i| matches!(self.sbs_rows[i], SideBySideRow::HunkHeader { .. })),
-                    DiffDisplayMode::ThreeWay => (end..row_count).rev().find(|&i| {
-                        matches!(self.three_way_rows[i], ThreeWayRow::HunkHeader { .. })
-                    }),
-                });
-                if let Some(pos) = prev {
-                    self.highlighted_row = Some(pos);
-                    self.scroll_row_into_view(pos, cx);
-                    cx.notify();
-                }
-                cx.stop_propagation();
-            }
-            "d" if !primary => {
-                self.toggle_display_mode(cx);
-            }
-            "c" if primary => {
-                self.copy_selected_lines(cx);
-            }
-            "a" if primary && row_count > 0 => {
-                self.selection_anchor = Some(0);
-                self.selected_lines = Some(0..row_count);
-                cx.notify();
-            }
-            "p" if !primary
-                && !event.keystroke.modifiers.alt
-                && !event.keystroke.modifiers.shift =>
-            {
-                // p: toggle partial line-selection mode. Meaningless for
-                // committed or stashed content, which cannot be staged at all.
-                if self.source.is_historical() {
-                    cx.stop_propagation();
-                    return;
-                }
-                self.partial_mode = !self.partial_mode;
-                if !self.partial_mode {
-                    self.selected_lines = None;
-                    self.selection_anchor = None;
-                }
-                cx.notify();
-                cx.stop_propagation();
-            }
-            "s" | "S" if !event.keystroke.modifiers.alt && !primary => {
-                // s: stage hunks under selection (or cursor hunk if no selection).
-                // Only the working tree can be staged; committed and stashed
-                // content is historical and has nothing to stage.
-                if self.source.staging_action() == Some(StagingAction::Stage) {
-                    if self.partial_mode {
-                        // Line-level staging: emit the selected change lines (additions
-                        // and deletions). Each pair carries its old/new line number; the
-                        // git layer matches additions on the new side and deletions on the
-                        // old side, so deletions must flow through unfiltered.
-                        let line_pairs = if let Some(sel) = &self.selected_lines {
-                            self.lines_under_selection(sel.clone())
-                                .into_iter()
-                                .filter(Self::is_change_line)
-                                .collect()
-                        } else {
-                            self.current_hunk_changes()
-                        };
-                        if !line_pairs.is_empty() {
-                            cx.emit(DiffViewerEvent::LineStageRequested(line_pairs));
-                        }
-                        // TODO(audit): BUG-15 surface a "no stageable lines" toast when a
-                        // partial selection yields nothing — needs a new DiffViewerEvent
-                        // variant + a handler arm in rgitui_workspace events.rs (the toast
-                        // system lives there), which can't be added from this crate alone.
-                    } else {
-                        let hunks = if let Some(sel) = &self.selected_lines {
-                            self.hunks_under_selection(sel.clone())
-                        } else {
-                            self.current_hunk_index()
-                                .map(|i| vec![i])
-                                .unwrap_or_default()
-                        };
-                        for idx in hunks {
-                            cx.emit(DiffViewerEvent::HunkStageRequested(idx));
-                        }
-                    }
-                }
-                cx.stop_propagation();
-            }
-            "u" | "U" if !event.keystroke.modifiers.alt && !primary => {
-                // u: unstage hunks under selection (or cursor hunk if no selection).
-                // Only the index can be unstaged.
-                if self.source.staging_action() == Some(StagingAction::Unstage) {
-                    if self.partial_mode {
-                        // Line-level unstaging: emit the selected change lines (additions
-                        // and deletions). Deletions must flow through so the git layer can
-                        // match them on the old side; filtering to additions would make
-                        // unstaging a pure deletion a silent no-op.
-                        let line_pairs = if let Some(sel) = &self.selected_lines {
-                            self.lines_under_selection(sel.clone())
-                                .into_iter()
-                                .filter(Self::is_change_line)
-                                .collect()
-                        } else {
-                            self.current_hunk_changes()
-                        };
-                        if !line_pairs.is_empty() {
-                            cx.emit(DiffViewerEvent::LineUnstageRequested(line_pairs));
-                        }
-                    } else {
-                        let hunks = if let Some(sel) = &self.selected_lines {
-                            self.hunks_under_selection(sel.clone())
-                        } else {
-                            self.current_hunk_index()
-                                .map(|i| vec![i])
-                                .unwrap_or_default()
-                        };
-                        for idx in hunks {
-                            cx.emit(DiffViewerEvent::HunkUnstageRequested(idx));
-                        }
-                    }
-                }
-                cx.stop_propagation();
-            }
-            "s" | "S" if event.keystroke.modifiers.alt && !primary => {
-                // Alt+S: stage the current hunk
-                if self.source.staging_action() == Some(StagingAction::Stage) {
-                    if let Some(idx) = self.current_hunk_index() {
-                        cx.emit(DiffViewerEvent::HunkStageRequested(idx));
-                    }
-                }
-                cx.stop_propagation();
-            }
-            "u" | "U" if event.keystroke.modifiers.alt && !primary => {
-                // Alt+U: unstage the current hunk
-                if self.source.staging_action() == Some(StagingAction::Unstage) {
-                    if let Some(idx) = self.current_hunk_index() {
-                        cx.emit(DiffViewerEvent::HunkUnstageRequested(idx));
-                    }
-                }
-                cx.stop_propagation();
-            }
-            _ => {}
+            return;
+        }
+        for idx in self.hunks_to_act_on() {
+            cx.emit(DiffViewerEvent::HunkUnstageRequested(idx));
+        }
+    }
+
+    /// Requests staging of just the hunk under the cursor.
+    pub fn stage_current_hunk(&mut self, cx: &mut Context<Self>) {
+        if self.source.staging_action() != Some(StagingAction::Stage) {
+            return;
+        }
+        if let Some(idx) = self.current_hunk_index() {
+            cx.emit(DiffViewerEvent::HunkStageRequested(idx));
+        }
+    }
+
+    /// Requests unstaging of just the hunk under the cursor.
+    pub fn unstage_current_hunk(&mut self, cx: &mut Context<Self>) {
+        if self.source.staging_action() != Some(StagingAction::Unstage) {
+            return;
+        }
+        if let Some(idx) = self.current_hunk_index() {
+            cx.emit(DiffViewerEvent::HunkUnstageRequested(idx));
+        }
+    }
+
+    /// The change lines under the selection, or the cursor hunk's if there is none.
+    fn change_lines_under_selection(&self) -> Vec<(Option<usize>, Option<usize>)> {
+        match &self.selected_lines {
+            Some(selection) => self
+                .lines_under_selection(selection.clone())
+                .into_iter()
+                .filter(Self::is_change_line)
+                .collect(),
+            None => self.current_hunk_changes(),
+        }
+    }
+
+    /// The hunks under the selection, or the cursor's hunk if there is none.
+    fn hunks_to_act_on(&self) -> Vec<usize> {
+        match &self.selected_lines {
+            Some(selection) => self.hunks_under_selection(selection.clone()),
+            None => self
+                .current_hunk_index()
+                .map(|i| vec![i])
+                .unwrap_or_default(),
         }
     }
 
@@ -3875,7 +3861,9 @@ impl Render for DiffViewer {
         let mut container = div()
             .id("diff-viewer")
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::handle_key_down))
+            // Bindings scoped to `DiffViewer` resolve to `diff::*` actions the
+            // workspace root handles; this crate cannot name them itself.
+            .key_context("DiffViewer")
             .on_mouse_up(MouseButton::Left, cx.listener(Self::end_mouse_selection))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_mouse_selection))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -5051,9 +5039,15 @@ mod view_tests {
     }
 
     /// Shows `source` in a focused viewer, selects every row so a staging
-    /// request would have a target, presses `s` then `u`, and returns whatever
-    /// staging requests came back.
-    fn staging_requests_after_pressing_s_and_u(source: DiffSource) -> Vec<String> {
+    /// request would have a target, invokes stage-then-unstage, and returns
+    /// whatever staging requests came back.
+    ///
+    /// These go through the methods rather than simulated keystrokes because the
+    /// `s`/`u` bindings are gpui actions declared in `rgitui_workspace`, which
+    /// sits above this crate and so cannot be reached from here. The keystrokes
+    /// are covered by the keymap registry's own tests; what matters here is that
+    /// the entry points the actions call refuse on historical content.
+    fn staging_requests_after_stage_then_unstage(source: DiffSource) -> Vec<String> {
         let mut probe = ViewTest::open(StagingProbe::new);
 
         probe.update(|probe, window, cx| {
@@ -5063,27 +5057,32 @@ mod view_tests {
             });
         });
 
-        // Guard against a vacuous test: the rows must actually exist, or `s`
-        // would find no hunk under the selection regardless of provenance.
+        // Guard against a vacuous test: the rows must actually exist, or the
+        // selection would find no hunk regardless of provenance.
         probe.read(|probe, cx| {
             let viewer = probe.viewer.read(cx);
             assert!(
                 viewer.row_count() > 0,
-                "display rows should be prepared before keys are pressed"
+                "display rows should be prepared before staging is attempted"
             );
         });
 
-        // ctrl-a selects every row, so `s`/`u` resolve to the whole hunk.
-        probe.simulate_keystroke("ctrl-a");
-        probe.simulate_keystroke("s");
-        probe.simulate_keystroke("u");
+        probe.update(|probe, _window, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                // Select every row, so the request resolves to the whole hunk.
+                viewer.select_all_lines(cx);
+                viewer.stage_selection(cx);
+                viewer.unstage_selection(cx);
+            });
+        });
 
         probe.read(|probe, _| probe.staging_requests())
     }
 
     #[test]
     fn pressing_s_or_u_on_a_commit_diff_requests_no_staging() {
-        let requests = staging_requests_after_pressing_s_and_u(DiffSource::Commit(OID.to_string()));
+        let requests =
+            staging_requests_after_stage_then_unstage(DiffSource::Commit(OID.to_string()));
         assert!(
             requests.is_empty(),
             "a committed diff must not be stageable, but the viewer emitted {requests:?}"
@@ -5092,7 +5091,8 @@ mod view_tests {
 
     #[test]
     fn pressing_s_or_u_on_a_stash_diff_requests_no_staging() {
-        let requests = staging_requests_after_pressing_s_and_u(DiffSource::Stash(OID.to_string()));
+        let requests =
+            staging_requests_after_stage_then_unstage(DiffSource::Stash(OID.to_string()));
         assert!(
             requests.is_empty(),
             "a stashed diff must not be stageable, but the viewer emitted {requests:?}"
@@ -5103,7 +5103,7 @@ mod view_tests {
     /// keys had simply stopped working everywhere.
     #[test]
     fn pressing_s_on_a_worktree_diff_still_requests_staging() {
-        let requests = staging_requests_after_pressing_s_and_u(DiffSource::Worktree);
+        let requests = staging_requests_after_stage_then_unstage(DiffSource::Worktree);
         assert_eq!(
             requests,
             vec!["HunkStageRequested(0)".to_string()],
@@ -5114,7 +5114,7 @@ mod view_tests {
     /// The mirror control case: the index unstages on `u` and ignores `s`.
     #[test]
     fn pressing_u_on_an_index_diff_still_requests_unstaging() {
-        let requests = staging_requests_after_pressing_s_and_u(DiffSource::Index);
+        let requests = staging_requests_after_stage_then_unstage(DiffSource::Index);
         assert_eq!(
             requests,
             vec!["HunkUnstageRequested(0)".to_string()],
@@ -5138,7 +5138,11 @@ mod view_tests {
             });
         });
 
-        probe.simulate_keystroke("p");
+        probe.update(|probe, _window, cx| {
+            probe
+                .viewer
+                .update(cx, |viewer, cx| viewer.toggle_partial_mode(cx));
+        });
         probe.read(|probe, cx| {
             assert!(
                 !probe.viewer.read(cx).partial_mode,
@@ -5158,9 +5162,17 @@ mod view_tests {
             });
         });
 
-        probe.simulate_keystroke("p");
+        probe.update(|probe, _window, cx| {
+            probe
+                .viewer
+                .update(cx, |viewer, cx| viewer.toggle_partial_mode(cx));
+        });
         probe.read(|probe, cx| assert!(probe.viewer.read(cx).partial_mode));
-        probe.simulate_keystroke("p");
+        probe.update(|probe, _window, cx| {
+            probe
+                .viewer
+                .update(cx, |viewer, cx| viewer.toggle_partial_mode(cx));
+        });
         probe.read(|probe, cx| assert!(!probe.viewer.read(cx).partial_mode));
     }
 }

@@ -7,10 +7,9 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     canvas, div, img, point, px, uniform_list, Animation, AnimationExt, App, Bounds, ClickEvent,
-    Context, CursorStyle, ElementId, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
-    ListSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, PathBuilder,
-    Pixels, Point, Render, ScrollStrategy, SharedString, Size, UniformListScrollHandle, WeakEntity,
-    Window,
+    Context, CursorStyle, ElementId, Entity, EventEmitter, FocusHandle, ListSizingBehavior,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, Render,
+    ScrollStrategy, SharedString, Size, UniformListScrollHandle, WeakEntity, Window,
 };
 use rgitui_git::{compute_graph, CommitInfo, FileChangeKind, GraphEdge, GraphRow, RefLabel};
 use rgitui_settings::{GraphStyle, SettingsState};
@@ -37,24 +36,177 @@ impl Render for DateColumnResize {
 
 /// Width of the commit graph context menu.
 const CONTEXT_MENU_WIDTH: f32 = 200.0;
-/// Number of action rows in the context menu.
-const CONTEXT_MENU_ITEM_COUNT: f32 = 14.0;
 /// Height of a single context-menu action row (`.h(px(26.))`).
 const CONTEXT_MENU_ITEM_HEIGHT: f32 = 26.0;
-/// Number of separators drawn between menu groups.
-const CONTEXT_MENU_SEPARATOR_COUNT: f32 = 4.0;
 /// Effective height of one separator: `.h(px(1.))` plus `.my(px(2.))` top and bottom.
 const CONTEXT_MENU_SEPARATOR_HEIGHT: f32 = 1.0 + 2.0 + 2.0;
 /// Combined top and bottom padding on the menu container (`.py(px(3.))`).
 const CONTEXT_MENU_VERTICAL_PADDING: f32 = 3.0 + 3.0;
 
-/// Natural rendered height of the context menu, derived from its real item and
-/// separator metrics. Shared by clamping and the dismiss hit-test so both agree
-/// on where the menu actually sits.
-const fn context_menu_height() -> f32 {
-    CONTEXT_MENU_ITEM_COUNT * CONTEXT_MENU_ITEM_HEIGHT
-        + CONTEXT_MENU_SEPARATOR_COUNT * CONTEXT_MENU_SEPARATOR_HEIGHT
+/// Natural rendered height of a context menu holding `items`.
+///
+/// Counted from the rows themselves rather than from a hand-maintained total, so
+/// adding or hiding an item cannot leave the menu mis-sized. Shared by the
+/// clamping and the dismiss hit-test, which have to agree on where the menu sits.
+fn context_menu_height(items: &[&GraphMenuItem]) -> f32 {
+    let separators = items.iter().filter(|item| item.separator_before).count();
+    items.len() as f32 * CONTEXT_MENU_ITEM_HEIGHT
+        + separators as f32 * CONTEXT_MENU_SEPARATOR_HEIGHT
         + CONTEXT_MENU_VERTICAL_PADDING
+}
+
+/// What a commit graph context-menu row does when clicked.
+///
+/// Carries no commit data: the row is built for one commit and
+/// [`GraphView::menu_event`] fills that in, which keeps the table below a plain
+/// description of the menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphMenuAction {
+    CherryPick,
+    Revert,
+    Checkout,
+    CreateBranch,
+    CreateTag,
+    BisectGood,
+    BisectBad,
+    Reset,
+    InteractiveRebase,
+    SquashSelected,
+    CopySha,
+    CopyMessage,
+    CopyAuthor,
+    CopyDate,
+    ViewOnGithub,
+}
+
+/// One row of the commit graph context menu.
+struct GraphMenuItem {
+    /// Row label.
+    label: &'static str,
+    /// Leading icon.
+    icon: IconName,
+    /// What clicking the row does.
+    action: GraphMenuAction,
+    /// Whether a group separator is drawn above this row.
+    separator_before: bool,
+    /// Whether the row renders in the error colour, because it rewrites or
+    /// discards committed work.
+    destructive: bool,
+}
+
+impl GraphMenuItem {
+    const fn new(label: &'static str, icon: IconName, action: GraphMenuAction) -> Self {
+        Self {
+            label,
+            icon,
+            action,
+            separator_before: false,
+            destructive: false,
+        }
+    }
+
+    /// Starts a new group: a separator is drawn above this row.
+    const fn grouped(mut self) -> Self {
+        self.separator_before = true;
+        self
+    }
+
+    /// Marks the row as rewriting or discarding work.
+    const fn destructive(mut self) -> Self {
+        self.destructive = true;
+        self
+    }
+}
+
+/// Every row the commit graph context menu can show, in order.
+///
+/// [`GraphView::context_menu_items`] filters it for the current selection; the
+/// menu's height is then derived from what survives, so no count is maintained
+/// by hand.
+const GRAPH_MENU_ITEMS: &[GraphMenuItem] = &[
+    GraphMenuItem::new(
+        "Cherry-pick commit",
+        IconName::GitCommit,
+        GraphMenuAction::CherryPick,
+    ),
+    GraphMenuItem::new("Revert commit", IconName::Undo, GraphMenuAction::Revert),
+    GraphMenuItem::new(
+        "Checkout commit",
+        IconName::Check,
+        GraphMenuAction::Checkout,
+    ),
+    GraphMenuItem::new(
+        "Create branch here",
+        IconName::GitBranch,
+        GraphMenuAction::CreateBranch,
+    ),
+    GraphMenuItem::new("Create tag here", IconName::Tag, GraphMenuAction::CreateTag),
+    GraphMenuItem::new(
+        "Mark as good (bisect)",
+        IconName::Check,
+        GraphMenuAction::BisectGood,
+    )
+    .grouped(),
+    GraphMenuItem::new(
+        "Mark as bad (bisect)",
+        IconName::X,
+        GraphMenuAction::BisectBad,
+    )
+    .destructive(),
+    GraphMenuItem::new("Reset to here", IconName::Trash, GraphMenuAction::Reset)
+        .grouped()
+        .destructive(),
+    GraphMenuItem::new(
+        "Interactive Rebase",
+        IconName::GitMerge,
+        GraphMenuAction::InteractiveRebase,
+    )
+    .grouped(),
+    // Only offered while the selection could actually be squashed — see
+    // `GraphView::context_menu_items`.
+    GraphMenuItem::new(
+        "Squash selected commits",
+        IconName::GitMerge,
+        GraphMenuAction::SquashSelected,
+    ),
+    GraphMenuItem::new("Copy SHA", IconName::Copy, GraphMenuAction::CopySha).grouped(),
+    GraphMenuItem::new(
+        "Copy commit message",
+        IconName::Edit,
+        GraphMenuAction::CopyMessage,
+    ),
+    GraphMenuItem::new(
+        "Copy author name",
+        IconName::User,
+        GraphMenuAction::CopyAuthor,
+    ),
+    GraphMenuItem::new("Copy date", IconName::Clock, GraphMenuAction::CopyDate),
+    GraphMenuItem::new(
+        "View on GitHub",
+        IconName::ExternalLink,
+        GraphMenuAction::ViewOnGithub,
+    ),
+];
+
+/// Smallest selection a squash can meld: fewer commits than this and there is
+/// nothing to squash into.
+const MIN_SQUASH_SELECTION: usize = 2;
+
+/// The context-menu rows to offer when `selected_commits` commits are selected.
+///
+/// "Squash selected commits" is only offered once there are two commits to meld;
+/// below that it would always fail, so it is hidden rather than shown disabled.
+/// The rest of the rules — a contiguous run on HEAD's own first-parent chain, no
+/// merge commit in the way — belong to the workspace's `plan_squash`, which this
+/// crate sits below. Clicking the row therefore takes the same route as the
+/// `graph::SquashSelected` keystroke and a selection that does not qualify is
+/// refused there, in the same words.
+fn menu_items_for_selection(selected_commits: usize) -> Vec<&'static GraphMenuItem> {
+    let squashable = selected_commits >= MIN_SQUASH_SELECTION;
+    GRAPH_MENU_ITEMS
+        .iter()
+        .filter(|item| squashable || item.action != GraphMenuAction::SquashSelected)
+        .collect()
 }
 
 /// Pre-computed unit circle vertex offsets (cos, sin) for 36-step circles.
@@ -135,6 +287,10 @@ fn quarter_arc_offsets() -> &'static [(f32, f32)] {
 #[derive(Debug, Clone)]
 pub enum GraphViewEvent {
     CommitSelected(git2::Oid),
+    /// The set of selected commits changed. Emitted alongside `CommitSelected`
+    /// for a single selection, and on its own while a multi-selection is built,
+    /// so command availability can follow without a diff being recomputed.
+    SelectionChanged,
     CherryPick(git2::Oid),
     RevertCommit(git2::Oid),
     CreateBranchAtCommit(git2::Oid),
@@ -165,6 +321,11 @@ pub enum GraphViewEvent {
     /// interactive rebase editor, allowing the user to reorder, squash, fixup,
     /// reword, or drop them.
     InteractiveRebase(git2::Oid),
+    /// Squash the selected commits together. The workspace validates the
+    /// selection and pre-fills the interactive rebase dialog, or explains why it
+    /// cannot — the same path the `graph::SquashSelected` keystroke takes, so the
+    /// two cannot disagree.
+    SquashSelected,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -374,6 +535,130 @@ fn worktree_targets_commit_immediately_above(
         })
 }
 
+/// The commit index displayed at `list_index`, or `None` when that row is a
+/// virtual worktree row.
+///
+/// `worktree_rows` is the ascending list of rows occupied by worktree
+/// pseudo-nodes: each one shifts every commit below it down by one.
+fn commit_index_for_row(worktree_rows: &[usize], list_index: usize) -> Option<usize> {
+    if worktree_rows.binary_search(&list_index).is_ok() {
+        return None;
+    }
+    let virtual_rows_above = worktree_rows.partition_point(|row| *row < list_index);
+    Some(list_index - virtual_rows_above)
+}
+
+/// The row `commit_index` is displayed at, or `None` when it is outside the
+/// window of commits that have a computed graph row.
+///
+/// The inverse of [`commit_index_for_row`]. `worktree_rows` must be ascending;
+/// a worktree row sitting at or above the commit's own row pushes it down, and
+/// because the rows are distinct and sorted, `row - ordinal` is non-decreasing —
+/// so a single pass is enough.
+fn row_for_commit_index(
+    worktree_rows: &[usize],
+    commit_count: usize,
+    commit_index: usize,
+) -> Option<usize> {
+    if commit_index >= commit_count {
+        return None;
+    }
+    let mut row = commit_index;
+    for worktree_row in worktree_rows {
+        if *worktree_row <= row {
+            row += 1;
+        }
+    }
+    Some(row)
+}
+
+/// The set of commits selected in the graph, plus the anchor a range extension
+/// grows from.
+///
+/// Members are *commit* indices, never list indices, so a virtual worktree row
+/// can never join the selection and inserting or removing one leaves it alone.
+/// The set is arbitrary rather than a single range: ctrl-click punches holes in
+/// it, and operations that need a contiguous run (squash, for one) validate that
+/// for themselves and explain the failure.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CommitSelection {
+    indices: std::collections::BTreeSet<usize>,
+    anchor: Option<usize>,
+    /// The selection as it stood when the anchor was last set. A range extension
+    /// unions the anchor range onto this, so extending again *replaces* the
+    /// previous range instead of accumulating every row the cursor passed over.
+    anchor_base: std::collections::BTreeSet<usize>,
+}
+
+impl CommitSelection {
+    /// A selection restored from commit indices, e.g. after the commit list was
+    /// reloaded and the previous members were looked up again by OID.
+    fn from_parts(indices: impl IntoIterator<Item = usize>, anchor: Option<usize>) -> Self {
+        let indices: std::collections::BTreeSet<usize> = indices.into_iter().collect();
+        Self {
+            anchor: anchor.filter(|_| !indices.is_empty()),
+            indices,
+            anchor_base: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.indices.clear();
+        self.anchor = None;
+        self.anchor_base.clear();
+    }
+
+    /// Collapses the selection onto one commit — a plain click or a plain
+    /// `j`/`k`, which must behave exactly as they did before multi-select.
+    fn replace(&mut self, commit_index: usize) {
+        self.indices.clear();
+        self.indices.insert(commit_index);
+        self.anchor = Some(commit_index);
+        // Extending from here selects exactly the anchor range.
+        self.anchor_base.clear();
+    }
+
+    /// Adds or removes one commit, leaving the rest of the selection alone, and
+    /// re-anchors so a following range extension grows from this commit.
+    fn toggle(&mut self, commit_index: usize) {
+        if !self.indices.remove(&commit_index) {
+            self.indices.insert(commit_index);
+        }
+        self.anchor = Some(commit_index);
+        self.anchor_base = self.indices.clone();
+    }
+
+    /// Selects the inclusive range between the anchor and `commit_index`, on top
+    /// of whatever was selected when the anchor was set.
+    fn extend_to(&mut self, commit_index: usize) {
+        let Some(anchor) = self.anchor else {
+            self.replace(commit_index);
+            return;
+        };
+        let (first, last) = (anchor.min(commit_index), anchor.max(commit_index));
+        self.indices = self.anchor_base.clone();
+        self.indices.extend(first..=last);
+    }
+
+    fn contains(&self, commit_index: usize) -> bool {
+        self.indices.contains(&commit_index)
+    }
+
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn anchor(&self) -> Option<usize> {
+        self.anchor
+    }
+
+    /// Members in ascending commit order — newest commit first, since the commit
+    /// list itself is ordered newest first.
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.indices.iter().copied()
+    }
+}
+
 /// The commit graph panel.
 pub struct GraphView {
     commits: Arc<Vec<CommitInfo>>,
@@ -381,6 +666,12 @@ pub struct GraphView {
     global_max_lane: usize,
     selected_index: Option<usize>,
     selected_oid: Option<git2::Oid>,
+    /// Every selected commit. The cursor (`selected_index`) is the member that
+    /// drives the diff and detail panels; the rest are highlighted only.
+    selection: CommitSelection,
+    /// [`Self::selection`] projected onto list indices, so a row can test its own
+    /// membership without walking the set on every frame.
+    selected_rows: Arc<HashSet<usize>>,
     row_height: f32,
     scroll_handle: UniformListScrollHandle,
     context_menu: Option<ContextMenuState>,
@@ -405,7 +696,9 @@ pub struct GraphView {
     search_debounce_task: Option<gpui::Task<()>>,
     worktree_infos: Vec<WorktreeGraphInfo>,
     worktree_row_positions: Vec<WorktreeRowPosition>,
-    worktree_row_set: HashSet<usize>,
+    /// Ascending list indices occupied by worktree pseudo-nodes. Drives the
+    /// list-index ↔ commit-index mapping.
+    worktree_rows: Vec<usize>,
     virtual_rows_prefix: Arc<Vec<usize>>,
     show_settings_popover: bool,
     /// SHA display length: 0 = default short (7), or specific length (7/8/10/12/40).
@@ -461,6 +754,8 @@ impl GraphView {
             global_max_lane: 0,
             selected_index: None,
             selected_oid: None,
+            selection: CommitSelection::default(),
+            selected_rows: Arc::new(HashSet::new()),
             row_height: 32.0,
             scroll_handle: UniformListScrollHandle::new(),
             context_menu: None,
@@ -478,7 +773,7 @@ impl GraphView {
             search_debounce_task: None,
             worktree_infos: Vec::new(),
             worktree_row_positions: Vec::new(),
-            worktree_row_set: HashSet::new(),
+            worktree_rows: Vec::new(),
             virtual_rows_prefix: Arc::new(Vec::new()),
             show_settings_popover: false,
             sha_display_length: 0,
@@ -558,7 +853,20 @@ impl GraphView {
                 let prev_selected_oid = this.selected_oid;
                 let prev_selected_index = this.selected_index;
                 let prev_selected_worktree =
-                    prev_selected_index.is_some_and(|index| this.worktree_row_set.contains(&index));
+                    prev_selected_index.is_some_and(|index| this.is_worktree_row(index));
+                // The multi-selection is remembered by OID too: commit indices
+                // shift whenever commits are loaded, filtered or reordered.
+                let prev_selected_oids: Vec<git2::Oid> = this
+                    .selection
+                    .iter()
+                    .filter_map(|commit_index| this.commits.get(commit_index))
+                    .map(|commit| commit.oid)
+                    .collect();
+                let prev_anchor_oid = this
+                    .selection
+                    .anchor()
+                    .and_then(|commit_index| this.commits.get(commit_index))
+                    .map(|commit| commit.oid);
 
                 this.global_max_lane = graph_rows
                     .iter()
@@ -592,6 +900,17 @@ impl GraphView {
                 } else {
                     this.selected_index = None;
                 }
+
+                // Members that survived the reload keep their place in the
+                // selection; the rest are dropped along with their commits.
+                let restored: Vec<usize> = prev_selected_oids
+                    .iter()
+                    .filter_map(|oid| this.commits.iter().position(|commit| commit.oid == *oid))
+                    .collect();
+                let restored_anchor = prev_anchor_oid
+                    .and_then(|oid| this.commits.iter().position(|commit| commit.oid == oid));
+                this.selection = CommitSelection::from_parts(restored, restored_anchor);
+                this.sync_selected_rows();
 
                 if this.show_search && !this.search_editor.read(cx).is_empty() {
                     this.update_search_filter(cx);
@@ -632,7 +951,7 @@ impl GraphView {
     /// exactly where the menu sits, even when clamping or scrolling occurs.
     fn context_menu_geometry(&self, click: Point<Pixels>) -> (Pixels, Pixels, Pixels, Pixels) {
         let menu_w = px(CONTEXT_MENU_WIDTH);
-        let natural_h = px(context_menu_height());
+        let natural_h = px(context_menu_height(&self.context_menu_items()));
         let bounds = self.container_bounds;
         // Cap the visible height to the container so a short window scrolls
         // rather than overflowing and clipping unreachable items.
@@ -665,22 +984,29 @@ impl GraphView {
             &self.worktree_infos,
             self.global_max_lane,
         );
-        self.worktree_row_set.clear();
-        for position in &self.worktree_row_positions {
-            self.worktree_row_set.insert(position.list_index);
-        }
+        // `compute_worktree_row_positions` returns positions sorted by list index,
+        // which is what the mapping helpers rely on.
+        self.worktree_rows = self
+            .worktree_row_positions
+            .iter()
+            .map(|position| position.list_index)
+            .collect();
+        debug_assert!(self.worktree_rows.windows(2).all(|pair| pair[0] < pair[1]));
 
         let visible_commit_count = self.commits.len().min(self.graph_rows.len());
         let total_items = visible_commit_count + self.worktree_row_positions.len();
         let mut virtual_rows_prefix = vec![0; total_items];
         let mut virtual_count = 0;
         for (list_index, prefix) in virtual_rows_prefix.iter_mut().enumerate() {
-            if self.worktree_row_set.contains(&list_index) {
+            if self.worktree_rows.binary_search(&list_index).is_ok() {
                 virtual_count += 1;
             }
             *prefix = virtual_count;
         }
         self.virtual_rows_prefix = Arc::new(virtual_rows_prefix);
+        // Rows shift when a worktree row appears or disappears, so the projection
+        // of the selection onto list indices has to follow.
+        self.sync_selected_rows();
     }
 
     fn worktree_row_at_list_index(&self, list_index: usize) -> Option<&WorktreeRowPosition> {
@@ -689,28 +1015,34 @@ impl GraphView {
             .find(|position| position.list_index == list_index)
     }
 
+    /// Whether `list_index` is a virtual worktree row rather than a commit.
+    fn is_worktree_row(&self, list_index: usize) -> bool {
+        self.worktree_rows.binary_search(&list_index).is_ok()
+    }
+
     fn commit_index_for_list_index(&self, list_index: usize) -> Option<usize> {
-        if self.worktree_row_set.contains(&list_index) {
+        if list_index >= self.total_list_items() {
             return None;
         }
-        self.virtual_rows_prefix
-            .get(list_index)
-            .map(|virtual_count| list_index - *virtual_count)
+        commit_index_for_row(&self.worktree_rows, list_index)
     }
 
     fn list_index_for_commit_index(&self, commit_index: usize) -> Option<usize> {
-        if commit_index >= self.commits.len().min(self.graph_rows.len()) {
-            return None;
-        }
-        let virtual_rows_before = self
-            .worktree_row_positions
+        row_for_commit_index(
+            &self.worktree_rows,
+            self.commits.len().min(self.graph_rows.len()),
+            commit_index,
+        )
+    }
+
+    /// Re-projects [`Self::selection`] onto the list indices the rows are drawn at.
+    fn sync_selected_rows(&mut self) {
+        let rows: HashSet<usize> = self
+            .selection
             .iter()
-            .enumerate()
-            .filter(|(ordinal, position)| {
-                position.list_index.saturating_sub(*ordinal) <= commit_index
-            })
-            .count();
-        Some(commit_index + virtual_rows_before)
+            .filter_map(|commit_index| self.list_index_for_commit_index(commit_index))
+            .collect();
+        self.selected_rows = Arc::new(rows);
     }
 
     /// Total number of list items (virtual worktree rows + commits).
@@ -731,6 +1063,30 @@ impl GraphView {
         self.selected_index
     }
 
+    /// Every selected commit, newest first.
+    ///
+    /// One plain click or one `j` leaves exactly one entry here, so callers that
+    /// only care about the cursor can keep using [`Self::selected_commit`].
+    pub fn selected_commits(&self) -> Vec<&CommitInfo> {
+        self.selection
+            .iter()
+            .filter_map(|commit_index| self.commits.get(commit_index))
+            .collect()
+    }
+
+    /// The OIDs of [`Self::selected_commits`], newest first.
+    pub fn selected_commit_oids(&self) -> Vec<git2::Oid> {
+        self.selected_commits()
+            .into_iter()
+            .map(|commit| commit.oid)
+            .collect()
+    }
+
+    /// How many commits are selected. Zero while a worktree row is the cursor.
+    pub fn selected_commit_count(&self) -> usize {
+        self.selection.len()
+    }
+
     pub fn commit_count(&self) -> usize {
         self.commits.len()
     }
@@ -738,6 +1094,40 @@ impl GraphView {
     /// Total number of rows in the list (includes the virtual working tree row).
     pub fn row_count(&self) -> usize {
         self.total_list_items()
+    }
+
+    /// The context-menu rows to show for the selection as it stands. See
+    /// [`menu_items_for_selection`].
+    fn context_menu_items(&self) -> Vec<&'static GraphMenuItem> {
+        menu_items_for_selection(self.selected_commit_count())
+    }
+
+    /// The event a context-menu row emits, bound to the commit it was opened on.
+    fn menu_event(action: GraphMenuAction, commit: &CommitInfo) -> GraphViewEvent {
+        let oid = commit.oid;
+        match action {
+            GraphMenuAction::CherryPick => GraphViewEvent::CherryPick(oid),
+            GraphMenuAction::Revert => GraphViewEvent::RevertCommit(oid),
+            GraphMenuAction::Checkout => GraphViewEvent::CheckoutCommit(oid),
+            GraphMenuAction::CreateBranch => GraphViewEvent::CreateBranchAtCommit(oid),
+            GraphMenuAction::CreateTag => GraphViewEvent::CreateTagAtCommit(oid),
+            GraphMenuAction::BisectGood => GraphViewEvent::BisectGood(oid),
+            GraphMenuAction::BisectBad => GraphViewEvent::BisectBad(oid),
+            GraphMenuAction::Reset => GraphViewEvent::ResetToCommit(oid, oid.to_string()),
+            GraphMenuAction::InteractiveRebase => GraphViewEvent::InteractiveRebase(oid),
+            GraphMenuAction::SquashSelected => GraphViewEvent::SquashSelected,
+            GraphMenuAction::CopySha => GraphViewEvent::CopyCommitSha(oid.to_string()),
+            GraphMenuAction::CopyMessage => {
+                GraphViewEvent::CopyCommitMessage(commit.message.clone())
+            }
+            GraphMenuAction::CopyAuthor => {
+                GraphViewEvent::CopyAuthorName(commit.author.name.clone())
+            }
+            GraphMenuAction::CopyDate => {
+                GraphViewEvent::CopyDate(commit.time.format("%Y-%m-%d %H:%M:%S").to_string())
+            }
+            GraphMenuAction::ViewOnGithub => GraphViewEvent::ViewOnGithub(oid),
+        }
     }
 
     fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
@@ -817,12 +1207,22 @@ impl GraphView {
     }
 
     /// Select an item by its index in the uniform list (accounts for working tree row).
+    ///
+    /// This is the plain-click / plain-`j` path, so it collapses any multi-selection
+    /// back onto the one row and re-anchors range extension there.
     fn select_list_index(&mut self, list_index: usize, cx: &mut Context<Self>) {
         let total = self.total_list_items();
         if list_index >= total {
             return;
         }
         self.selected_index = Some(list_index);
+        match self.commit_index_for_list_index(list_index) {
+            Some(commit_index) => self.selection.replace(commit_index),
+            // A worktree row is not a commit, so nothing stays selected.
+            None => self.selection.clear(),
+        }
+        self.sync_selected_rows();
+        cx.emit(GraphViewEvent::SelectionChanged);
         if let Some(worktree_idx) = self
             .worktree_row_at_list_index(list_index)
             .map(|position| position.worktree_idx)
@@ -841,6 +1241,137 @@ impl GraphView {
             }
         }
         cx.notify();
+    }
+
+    /// The commit the cursor sits on, or `None` when it sits on a worktree row.
+    fn cursor_commit_index(&self) -> Option<usize> {
+        self.selected_index
+            .and_then(|list_index| self.commit_index_for_list_index(list_index))
+    }
+
+    /// Adds or removes one row without disturbing the rest of the selection —
+    /// the secondary-click gesture.
+    ///
+    /// Worktree rows carry no commit, so a toggle on one is ignored rather than
+    /// letting a virtual row into the selection.
+    pub fn toggle_selection_at_list_index(&mut self, list_index: usize, cx: &mut Context<Self>) {
+        let Some(commit_index) = self.commit_index_for_list_index(list_index) else {
+            return;
+        };
+        if commit_index >= self.commits.len() {
+            return;
+        }
+        self.selection.toggle(commit_index);
+        if self.selection.contains(commit_index) {
+            // Move the cursor onto the row that was just added, so a following
+            // extension grows from where the user last clicked.
+            self.selected_index = Some(list_index);
+            self.selected_oid = self.commits.get(commit_index).map(|commit| commit.oid);
+        }
+        self.sync_selected_rows();
+        self.emit_single_selection(cx);
+        cx.emit(GraphViewEvent::SelectionChanged);
+        cx.notify();
+    }
+
+    /// Extends the selection from the anchor to `list_index` — the shift-click
+    /// gesture. A worktree row has no commit to extend to, so it is ignored.
+    pub fn extend_selection_to_list_index(&mut self, list_index: usize, cx: &mut Context<Self>) {
+        let Some(commit_index) = self.commit_index_for_list_index(list_index) else {
+            return;
+        };
+        self.extend_selection_to_commit(commit_index, None, cx);
+    }
+
+    /// Extends the selection down one commit, keeping the anchor put.
+    pub fn extend_selection_next(&mut self, cx: &mut Context<Self>) {
+        self.extend_selection_by_one(true, cx);
+    }
+
+    /// Extends the selection up one commit, keeping the anchor put.
+    pub fn extend_selection_prev(&mut self, cx: &mut Context<Self>) {
+        self.extend_selection_by_one(false, cx);
+    }
+
+    /// Moves the cursor one commit and extends the selection to it.
+    ///
+    /// The step is taken in *commit* space, so a virtual worktree row between two
+    /// commits is stepped straight over: it can never be part of the selection.
+    fn extend_selection_by_one(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let commit_count = self.commits.len().min(self.graph_rows.len());
+        if commit_count == 0 {
+            return;
+        }
+        let Some(cursor) = self.cursor_commit_index() else {
+            // The cursor is on a worktree row (or nowhere): there is no commit to
+            // extend from, so fall back to plain movement.
+            if forward {
+                self.select_next_row(cx);
+            } else {
+                self.select_prev_row(cx);
+            }
+            return;
+        };
+        let target = if forward {
+            cursor + 1
+        } else {
+            match cursor.checked_sub(1) {
+                Some(target) => target,
+                None => return,
+            }
+        };
+        if target >= commit_count {
+            return;
+        }
+        self.extend_selection_to_commit(target, Some(ScrollStrategy::Center), cx);
+    }
+
+    fn extend_selection_to_commit(
+        &mut self,
+        commit_index: usize,
+        scroll: Option<ScrollStrategy>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(list_index) = self.list_index_for_commit_index(commit_index) else {
+            return;
+        };
+        if self.selection.anchor().is_none() {
+            // Nothing anchored yet: anchor where the cursor is, so shift-j from a
+            // fresh selection grows from the current row rather than jumping.
+            let anchor = self.cursor_commit_index().unwrap_or(commit_index);
+            self.selection.replace(anchor);
+        }
+        self.selection.extend_to(commit_index);
+        self.selected_index = Some(list_index);
+        self.selected_oid = self.commits.get(commit_index).map(|commit| commit.oid);
+        self.sync_selected_rows();
+        self.emit_single_selection(cx);
+        cx.emit(GraphViewEvent::SelectionChanged);
+        if let Some(strategy) = scroll {
+            self.scroll_handle.scroll_to_item(list_index, strategy);
+        }
+        cx.notify();
+    }
+
+    /// Emits `CommitSelected` only while exactly one commit is selected.
+    ///
+    /// Growing a multi-selection must not fire a diff computation per row, so the
+    /// diff and detail panels keep showing whatever single commit was last chosen.
+    fn emit_single_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selection.len() != 1 {
+            return;
+        }
+        let Some(commit_index) = self.selection.iter().next() else {
+            return;
+        };
+        let Some(oid) = self.commits.get(commit_index).map(|commit| commit.oid) else {
+            return;
+        };
+        if let Some(list_index) = self.list_index_for_commit_index(commit_index) {
+            self.selected_index = Some(list_index);
+        }
+        self.selected_oid = Some(oid);
+        cx.emit(GraphViewEvent::CommitSelected(oid));
     }
 
     /// Toggle the search bar visibility. Clears query when hiding.
@@ -997,107 +1528,90 @@ impl GraphView {
     }
 
     /// Handle key events on the focused search input.
-    fn handle_graph_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .search_editor
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window)
-        {
-            if event.keystroke.key.as_str() == "escape" {
-                // Cancel any in-progress drag-to-rebase.
-                self.dragging_oid = None;
-                self.drag_start_position = None;
-                self.drag_moved = false;
-                self.suppress_next_click = false;
-                self.show_search = false;
-                self.search_editor
-                    .update(cx, |e: &mut rgitui_ui::TextInput, cx| e.clear(cx));
-                self.filter_matches.clear();
-                self.filter_match_set_arc = Arc::new(HashSet::new());
-                self.current_match = 0;
-                self.graph_focus.focus(window, cx);
-                cx.notify();
-            }
+    /// Moves the selection by one row, scrolling it into view.
+    ///
+    /// The workspace drives this from the `graph::*` actions: this crate sits
+    /// below `rgitui_workspace` in the dependency graph and so cannot name them.
+    pub fn select_next_row(&mut self, cx: &mut Context<Self>) {
+        let total = self.total_list_items();
+        let next = match self.selected_index {
+            Some(index) if index + 1 < total => index + 1,
+            None if total > 0 => 0,
+            _ => return,
+        };
+        self.select_row(next, ScrollStrategy::Center, cx);
+    }
+
+    /// Moves the selection up one row, scrolling it into view.
+    pub fn select_prev_row(&mut self, cx: &mut Context<Self>) {
+        let next = match self.selected_index {
+            Some(index) if index > 0 => index - 1,
+            None if self.total_list_items() > 0 => 0,
+            _ => return,
+        };
+        self.select_row(next, ScrollStrategy::Center, cx);
+    }
+
+    /// Selects the newest commit.
+    pub fn select_first_row(&mut self, cx: &mut Context<Self>) {
+        if self.total_list_items() > 0 {
+            self.select_row(0, ScrollStrategy::Top, cx);
+        }
+    }
+
+    /// Selects the oldest loaded commit.
+    pub fn select_last_row(&mut self, cx: &mut Context<Self>) {
+        let total = self.total_list_items();
+        if total > 0 {
+            self.select_row(total - 1, ScrollStrategy::Center, cx);
+        }
+    }
+
+    fn select_row(&mut self, index: usize, strategy: ScrollStrategy, cx: &mut Context<Self>) {
+        self.select_list_index(index, cx);
+        self.scroll_handle.scroll_to_item(index, strategy);
+    }
+
+    /// Closes the search field, or dismisses the context menu.
+    ///
+    /// Also cancels an in-progress drag-to-rebase, which a stray Esc must not
+    /// leave half-applied.
+    pub fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dragging_oid = None;
+        self.drag_start_position = None;
+        self.drag_moved = false;
+        self.suppress_next_click = false;
+
+        if self.show_search {
+            self.show_search = false;
+            self.search_editor
+                .update(cx, |editor: &mut rgitui_ui::TextInput, cx| editor.clear(cx));
+            self.filter_matches.clear();
+            self.filter_match_set_arc = Arc::new(HashSet::new());
+            self.current_match = 0;
+            self.graph_focus.focus(window, cx);
+            cx.notify();
             return;
         }
-        let keystroke = &event.keystroke;
-        let key = keystroke.key.as_str();
-        // The platform's primary modifier: Command on macOS, Control elsewhere.
-        // Treating both as interchangeable made the Windows key act as Control.
-        let primary = keystroke.modifiers.secondary();
 
-        let total = self.total_list_items();
-        match key {
-            "j" | "down" if !primary => {
-                let next = match self.selected_index {
-                    Some(i) if i + 1 < total => i + 1,
-                    None if total > 0 => 0,
-                    _ => return,
-                };
-                self.select_list_index(next, cx);
-                self.scroll_handle
-                    .scroll_to_item(next, ScrollStrategy::Center);
-            }
-            "k" | "up" if !primary => {
-                let next = match self.selected_index {
-                    Some(i) if i > 0 => i - 1,
-                    None if total > 0 => 0,
-                    _ => return,
-                };
-                self.select_list_index(next, cx);
-                self.scroll_handle
-                    .scroll_to_item(next, ScrollStrategy::Center);
-            }
-            "g" if !primary && !keystroke.modifiers.shift
-                && total > 0 => {
-                    self.select_list_index(0, cx);
-                    self.scroll_handle
-                        .scroll_to_item(0, ScrollStrategy::Top);
-                }
-            "g" if keystroke.modifiers.shift
-                && total > 0 => {
-                    let last = total - 1;
-                    self.select_list_index(last, cx);
-                    self.scroll_handle
-                        .scroll_to_item(last, ScrollStrategy::Center);
-                }
-            "end"
-                if total > 0 => {
-                    let last = total - 1;
-                    self.select_list_index(last, cx);
-                    self.scroll_handle
-                        .scroll_to_item(last, ScrollStrategy::Center);
-                }
-            "home"
-                if total > 0 => {
-                    self.select_list_index(0, cx);
-                    self.scroll_handle
-                        .scroll_to_item(0, ScrollStrategy::Top);
-                }
-            "/" if !primary => {
-                self.show_search = true;
-                self.search_editor.update(cx, |e: &mut rgitui_ui::TextInput, cx| e.focus(window, cx));
-                cx.notify();
-            }
-            "escape"
-                // Dismiss context menu or deselect
-                if self.context_menu.is_some() => {
-                    self.dismiss_context_menu(cx);
-                }
-            "y" | "Y" if !primary && !keystroke.modifiers.shift => {
-                // Copy SHA of selected commit (standard GitKraken shortcut)
-                if let Some(commit) = self.selected_commit() {
-                    let sha = format!("{}", commit.oid);
-                    cx.emit(GraphViewEvent::CopyCommitSha(sha));
-                }
-            }
-            _ => {}
+        if self.context_menu.is_some() {
+            self.dismiss_context_menu(cx);
+        }
+    }
+
+    /// Copies the selected commit's SHA to the clipboard.
+    pub fn copy_selected_sha(&mut self, cx: &mut Context<Self>) {
+        if let Some(commit) = self.selected_commit() {
+            let sha = commit.oid.to_string();
+            cx.emit(GraphViewEvent::CopyCommitSha(sha));
+        }
+    }
+
+    /// Copies the selected commit's message to the clipboard.
+    pub fn copy_selected_message(&mut self, cx: &mut Context<Self>) {
+        if let Some(commit) = self.selected_commit() {
+            let message = commit.message.clone();
+            cx.emit(GraphViewEvent::CopyCommitMessage(message));
         }
     }
 }
@@ -1205,6 +1719,7 @@ impl Render for GraphView {
         let commits = self.commits.clone();
         let graph_rows = self.graph_rows.clone();
         let selected_index = self.selected_index;
+        let selected_rows = Arc::clone(&self.selected_rows);
         let worktree_infos = self.worktree_infos.clone();
         let worktree_row_positions = self.worktree_row_positions.clone();
         let virtual_rows_prefix = self.virtual_rows_prefix.clone();
@@ -1601,7 +2116,9 @@ impl Render for GraphView {
                         let commit = &commits[commit_idx];
                         let oid = commit.oid;
                         let graph_row = &graph_rows[commit_idx];
-                        let selected = selected_index == Some(i);
+                        // Every member of a multi-selection is highlighted the same
+                        // way as a lone selection; the cursor is `selected_index`.
+                        let selected = selected_index == Some(i) || selected_rows.contains(&i);
                         let is_current_match = current_match_index == Some(commit_idx);
                         let is_any_match = has_search_query && filter_match_set.contains(&commit_idx);
                         let is_head_row = graph_row.is_head;
@@ -1726,9 +2243,14 @@ impl Render for GraphView {
                                                 return;
                                             }
                                             this.dismiss_context_menu(cx);
+                                            let modifiers = event.modifiers();
                                             if event.click_count() >= 2 {
                                                 // Double-click: checkout this commit
                                                 cx.emit(GraphViewEvent::CheckoutCommit(oid));
+                                            } else if modifiers.shift {
+                                                this.extend_selection_to_list_index(i, cx);
+                                            } else if modifiers.secondary() {
+                                                this.toggle_selection_at_list_index(i, cx);
                                             } else {
                                                 this.select_list_index(i, cx);
                                             }
@@ -2216,8 +2738,9 @@ impl Render for GraphView {
         let mut container = div()
             .id("graph-view")
             .track_focus(&self.graph_focus)
+            // Bindings scoped to `GraphView` resolve to `graph::*` actions the
+            // workspace root handles; this crate cannot name them itself.
             .key_context("GraphView")
-            .on_key_down(cx.listener(Self::handle_graph_key_down))
             .relative()
             .v_flex()
             .size_full()
@@ -2431,14 +2954,8 @@ impl Render for GraphView {
         // Context menu overlay
         if let Some(ref menu_state) = self.context_menu {
             if let Some(commit) = self.commits.get(menu_state.commit_index) {
-                let oid = commit.oid;
-                let sha = format!("{}", oid);
-                let msg_clone = commit.message.clone();
-                let author_name_clone = commit.author.name.clone();
-                let date_clone = commit.time.format("%Y-%m-%d %H:%M:%S").to_string();
                 let pos = menu_state.position;
                 let weak = cx.weak_entity();
-                let sha_clone = sha.clone();
 
                 let menu_bg = colors.elevated_surface_background;
                 let menu_border = colors.border;
@@ -2446,22 +2963,7 @@ impl Render for GraphView {
                 let menu_active = colors.ghost_element_active;
                 let menu_accent = colors.text_accent;
 
-                let menu_items: Vec<(&str, IconName)> = vec![
-                    ("Cherry-pick commit", IconName::GitCommit),
-                    ("Revert commit", IconName::Undo),
-                    ("Checkout commit", IconName::Check),
-                    ("Create branch here", IconName::GitBranch),
-                    ("Create tag here", IconName::Tag),
-                    ("Mark as good (bisect)", IconName::Check),
-                    ("Mark as bad (bisect)", IconName::X),
-                    ("Reset to here", IconName::Trash),
-                    ("Interactive Rebase", IconName::GitMerge),
-                    ("Copy SHA", IconName::Copy),
-                    ("Copy commit message", IconName::Edit),
-                    ("Copy author name", IconName::User),
-                    ("Copy date", IconName::Clock),
-                    ("View on GitHub", IconName::ExternalLink),
-                ];
+                let items = self.context_menu_items();
 
                 // Placement and visible height, clamped to the container. Shared
                 // with the dismiss hit-test so both agree on the menu rectangle.
@@ -2501,13 +3003,8 @@ impl Render for GraphView {
                         cx.stop_propagation();
                     });
 
-                for (idx, (label_text, icon_name)) in menu_items.iter().enumerate() {
-                    let label: SharedString = (*label_text).into();
-                    let icon = *icon_name;
-
-                    // Add separator before bisect options, before destructive "Reset",
-                    // before Interactive Rebase, and before clipboard ops
-                    if idx == 5 || idx == 7 || idx == 8 || idx == 12 {
+                for (idx, item) in items.iter().enumerate() {
+                    if item.separator_before {
                         menu = menu.child(
                             div()
                                 .w_full()
@@ -2518,237 +3015,51 @@ impl Render for GraphView {
                         );
                     }
 
-                    let mut item = div()
-                        .id(ElementId::NamedInteger("ctx-action".into(), idx as u64))
-                        .h_flex()
-                        .w_full()
-                        .h(px(26.))
-                        .px(px(8.))
-                        .mx(px(4.))
-                        .gap(px(6.))
-                        .items_center()
-                        .cursor_pointer()
-                        .rounded(px(3.))
-                        .hover(move |s| s.bg(menu_hover).border_l_2().border_color(menu_accent))
-                        .active(move |s| s.bg(menu_active));
-
-                    match idx {
-                        0 => {
-                            let w = weak.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::CherryPick(oid));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        1 => {
-                            let w = weak.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::RevertCommit(oid));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        2 => {
-                            let w = weak.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::CheckoutCommit(oid));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        3 => {
-                            let w = weak.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::CreateBranchAtCommit(oid));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        4 => {
-                            let w = weak.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::CreateTagAtCommit(oid));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        5 => {
-                            let w = weak.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::BisectGood(oid));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        6 => {
-                            let w = weak.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::BisectBad(oid));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        7 => {
-                            let w = weak.clone();
-                            let sha_for_reset = sha_clone.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    let sha_val = sha_for_reset.clone();
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::ResetToCommit(oid, sha_val));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        8 => {
-                            // Interactive Rebase — emit event with the right-clicked commit's OID.
-                            // The workspace handler will build the commit list from HEAD down
-                            // to (including) this commit and open the rebase editor.
-                            let w = weak.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::InteractiveRebase(oid));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        9 => {
-                            let w = weak.clone();
-                            let sha_for_click = sha_clone.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    let sha_val = sha_for_click.clone();
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::CopyCommitSha(sha_val));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        10 => {
-                            let w = weak.clone();
-                            let msg_for_click = msg_clone.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    let msg_val = msg_for_click.clone();
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::CopyCommitMessage(msg_val));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        11 => {
-                            let w = weak.clone();
-                            let author_for_click = author_name_clone.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    let author_val = author_for_click.clone();
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::CopyAuthorName(author_val));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        12 => {
-                            let w = weak.clone();
-                            let date_for_click = date_clone.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    let date_val = date_for_click.clone();
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::CopyDate(date_val));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        13 => {
-                            // View on GitHub — emit OID; workspace handler constructs the URL.
-                            let w = weak.clone();
-                            item = item.on_click(
-                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                    w.update(cx, |this: &mut GraphView, cx| {
-                                        this.context_menu = None;
-                                        cx.emit(GraphViewEvent::ViewOnGithub(oid));
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            );
-                        }
-                        _ => {}
-                    }
-
-                    // Destructive actions render in error color (Bad and Reset)
-                    let item_color = if idx == 6 || idx == 7 {
-                        Color::Error
+                    // Built here rather than in the click handler so the row
+                    // captures the commit the menu was opened on, even if the
+                    // selection moves before the click lands.
+                    let event = Self::menu_event(item.action, commit);
+                    let weak = weak.clone();
+                    let (icon_color, label_color) = if item.destructive {
+                        (Color::Error, Color::Error)
                     } else {
-                        Color::Muted
-                    };
-                    let label_color = if idx == 6 || idx == 7 {
-                        Color::Error
-                    } else {
-                        Color::Default
+                        (Color::Muted, Color::Default)
                     };
 
-                    item = item
-                        .child(Icon::new(icon).size(IconSize::XSmall).color(item_color))
-                        .child(Label::new(label).size(LabelSize::XSmall).color(label_color));
-
-                    menu = menu.child(item);
+                    menu = menu.child(
+                        div()
+                            .id(ElementId::NamedInteger("ctx-action".into(), idx as u64))
+                            .h_flex()
+                            .w_full()
+                            .h(px(CONTEXT_MENU_ITEM_HEIGHT))
+                            .px(px(8.))
+                            .mx(px(4.))
+                            .gap(px(6.))
+                            .items_center()
+                            .cursor_pointer()
+                            .rounded(px(3.))
+                            .hover(move |s| s.bg(menu_hover).border_l_2().border_color(menu_accent))
+                            .active(move |s| s.bg(menu_active))
+                            .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                                let event = event.clone();
+                                weak.update(cx, |this: &mut GraphView, cx| {
+                                    this.context_menu = None;
+                                    cx.emit(event);
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .child(
+                                Icon::new(item.icon)
+                                    .size(IconSize::XSmall)
+                                    .color(icon_color),
+                            )
+                            .child(
+                                Label::new(SharedString::from(item.label))
+                                    .size(LabelSize::XSmall)
+                                    .color(label_color),
+                            ),
+                    );
                 }
 
                 let menu = menu.with_animation(
@@ -3625,6 +3936,72 @@ mod tests {
         git2::Oid::from_bytes(&bytes).unwrap()
     }
 
+    use menu_items_for_selection as menu_items;
+
+    #[test]
+    fn squash_is_offered_only_once_two_commits_are_selected() {
+        for selected in [0, 1] {
+            assert!(
+                !menu_items(selected)
+                    .iter()
+                    .any(|item| item.action == GraphMenuAction::SquashSelected),
+                "squash offered with {selected} commit(s) selected"
+            );
+        }
+        for selected in [2, 5] {
+            assert!(
+                menu_items(selected)
+                    .iter()
+                    .any(|item| item.action == GraphMenuAction::SquashSelected),
+                "squash missing with {selected} commits selected"
+            );
+        }
+    }
+
+    /// The bug the hard-coded `CONTEXT_MENU_ITEM_COUNT` used to cause: an item
+    /// added without touching the constant left the menu sized for the old list,
+    /// clipping the last row.
+    #[test]
+    fn the_menu_height_follows_the_rows_it_actually_has() {
+        let without = context_menu_height(&menu_items(1));
+        let with = context_menu_height(&menu_items(2));
+        assert_eq!(
+            with - without,
+            CONTEXT_MENU_ITEM_HEIGHT,
+            "showing squash must add exactly one row's worth of height"
+        );
+
+        let rows = menu_items(2).len() as f32;
+        let separators = menu_items(2)
+            .iter()
+            .filter(|item| item.separator_before)
+            .count() as f32;
+        assert_eq!(
+            with,
+            rows * CONTEXT_MENU_ITEM_HEIGHT
+                + separators * CONTEXT_MENU_SEPARATOR_HEIGHT
+                + CONTEXT_MENU_VERTICAL_PADDING
+        );
+    }
+
+    #[test]
+    fn every_menu_row_is_distinct_and_no_group_starts_the_menu() {
+        let mut seen: Vec<GraphMenuAction> = Vec::new();
+        for item in GRAPH_MENU_ITEMS {
+            assert!(!item.label.is_empty());
+            assert!(
+                !seen.contains(&item.action),
+                "{:?} appears twice in the menu",
+                item.action
+            );
+            seen.push(item.action);
+        }
+        assert!(
+            !GRAPH_MENU_ITEMS[0].separator_before,
+            "a separator above the first row draws a stray line inside the border"
+        );
+    }
+
     fn make_commit(oid: u8, parents: &[u8], refs: Vec<RefLabel>) -> CommitInfo {
         CommitInfo {
             oid: make_oid(oid),
@@ -3919,5 +4296,230 @@ mod tests {
         let t = now - Duration::days(400);
         let result = format_relative_time(&t, now);
         assert_eq!(result, "1y ago");
+    }
+
+    // ── Row ↔ commit index mapping ────────────────────────────────────
+
+    /// The list indices worktree rows occupy for a real layout, so the mapping
+    /// tests below are pinned to what `compute_worktree_row_positions` produces
+    /// rather than to a hand-guessed arrangement.
+    fn worktree_rows_for(commits: &[CommitInfo], worktrees: &[WorktreeGraphInfo]) -> Vec<usize> {
+        let graph_rows = compute_graph(commits);
+        compute_worktree_row_positions(
+            commits,
+            &graph_rows,
+            worktrees,
+            graph_lane_count(&graph_rows),
+        )
+        .iter()
+        .map(|position| position.list_index)
+        .collect()
+    }
+
+    #[test]
+    fn rows_map_to_commits_one_to_one_without_worktree_rows() {
+        for commit_index in 0..3 {
+            assert_eq!(
+                row_for_commit_index(&[], 3, commit_index),
+                Some(commit_index)
+            );
+            assert_eq!(commit_index_for_row(&[], commit_index), Some(commit_index));
+        }
+        assert_eq!(row_for_commit_index(&[], 3, 3), None);
+    }
+
+    #[test]
+    fn an_interleaved_worktree_row_shifts_every_commit_below_it() {
+        // 3 -> 2 -> 1 with a dirty worktree on commit 2 (commit index 1), whose
+        // pseudo-node therefore takes the row commit 2 used to sit on.
+        let commits = vec![
+            make_commit(3, &[2], vec![RefLabel::Head]),
+            make_commit(2, &[1], Vec::new()),
+            make_commit(1, &[], Vec::new()),
+        ];
+        let worktrees = vec![dirty_worktree("wip", Some(make_oid(2)), false)];
+        let worktree_rows = worktree_rows_for(&commits, &worktrees);
+        assert_eq!(worktree_rows, vec![1]);
+
+        // The commit above the worktree row keeps its row; the ones below shift.
+        assert_eq!(row_for_commit_index(&worktree_rows, 3, 0), Some(0));
+        assert_eq!(row_for_commit_index(&worktree_rows, 3, 1), Some(2));
+        assert_eq!(row_for_commit_index(&worktree_rows, 3, 2), Some(3));
+
+        assert_eq!(commit_index_for_row(&worktree_rows, 0), Some(0));
+        // The worktree row itself is not a commit.
+        assert_eq!(commit_index_for_row(&worktree_rows, 1), None);
+        assert_eq!(commit_index_for_row(&worktree_rows, 2), Some(1));
+        assert_eq!(commit_index_for_row(&worktree_rows, 3), Some(2));
+    }
+
+    #[test]
+    fn several_worktree_rows_round_trip_through_the_mapping() {
+        let commits = vec![
+            make_commit(4, &[3], vec![RefLabel::Head]),
+            make_commit(3, &[2], Vec::new()),
+            make_commit(2, &[1], Vec::new()),
+            make_commit(1, &[], Vec::new()),
+        ];
+        let worktrees = vec![
+            dirty_worktree("current", Some(make_oid(4)), true),
+            dirty_worktree("other", Some(make_oid(2)), false),
+        ];
+        let worktree_rows = worktree_rows_for(&commits, &worktrees);
+        assert_eq!(worktree_rows.len(), 2);
+
+        for commit_index in 0..commits.len() {
+            let row = row_for_commit_index(&worktree_rows, commits.len(), commit_index)
+                .expect("every commit has a row");
+            assert!(
+                !worktree_rows.contains(&row),
+                "commit {commit_index} was mapped onto worktree row {row}"
+            );
+            assert_eq!(
+                commit_index_for_row(&worktree_rows, row),
+                Some(commit_index)
+            );
+        }
+        for row in &worktree_rows {
+            assert_eq!(commit_index_for_row(&worktree_rows, *row), None);
+        }
+    }
+
+    // ── Selection set mechanics ───────────────────────────────────────
+
+    fn members(selection: &CommitSelection) -> Vec<usize> {
+        selection.iter().collect()
+    }
+
+    #[test]
+    fn a_plain_selection_holds_one_commit_and_anchors_there() {
+        let mut selection = CommitSelection::default();
+        selection.replace(4);
+        assert_eq!(members(&selection), vec![4]);
+        assert_eq!(selection.anchor(), Some(4));
+        assert_eq!(selection.len(), 1);
+
+        // A second plain selection replaces the first — this is the click and
+        // `j`/`k` path, which must behave exactly as it did before multi-select.
+        selection.replace(7);
+        assert_eq!(members(&selection), vec![7]);
+        assert_eq!(selection.anchor(), Some(7));
+    }
+
+    #[test]
+    fn toggling_adds_and_removes_single_commits() {
+        let mut selection = CommitSelection::default();
+        selection.replace(2);
+        selection.toggle(5);
+        selection.toggle(8);
+        assert_eq!(members(&selection), vec![2, 5, 8]);
+        assert!(selection.contains(5));
+
+        selection.toggle(5);
+        assert_eq!(members(&selection), vec![2, 8]);
+        assert!(!selection.contains(5));
+        // The anchor follows the toggled row even when it was removed.
+        assert_eq!(selection.anchor(), Some(5));
+    }
+
+    #[test]
+    fn extending_grows_a_range_from_the_anchor_in_both_directions() {
+        let mut selection = CommitSelection::default();
+        selection.replace(3);
+        selection.extend_to(5);
+        assert_eq!(members(&selection), vec![3, 4, 5]);
+        // Re-extending replaces the previous range instead of accumulating.
+        selection.extend_to(4);
+        assert_eq!(members(&selection), vec![3, 4]);
+        // Crossing the anchor selects the other side of it, anchor unmoved.
+        selection.extend_to(1);
+        assert_eq!(members(&selection), vec![1, 2, 3]);
+        assert_eq!(selection.anchor(), Some(3));
+    }
+
+    #[test]
+    fn extending_keeps_what_was_selected_when_the_anchor_was_set() {
+        let mut selection = CommitSelection::default();
+        selection.replace(0);
+        selection.toggle(4);
+        selection.extend_to(6);
+        assert_eq!(members(&selection), vec![0, 4, 5, 6]);
+    }
+
+    #[test]
+    fn extending_without_an_anchor_selects_just_the_target() {
+        let mut selection = CommitSelection::default();
+        selection.extend_to(9);
+        assert_eq!(members(&selection), vec![9]);
+        assert_eq!(selection.anchor(), Some(9));
+    }
+
+    #[test]
+    fn a_plain_selection_resets_the_anchor_and_drops_the_rest() {
+        let mut selection = CommitSelection::default();
+        selection.replace(2);
+        selection.extend_to(6);
+        assert_eq!(selection.len(), 5);
+
+        selection.replace(6);
+        assert_eq!(members(&selection), vec![6]);
+        assert_eq!(selection.anchor(), Some(6));
+        // Extending after the reset grows from the new anchor only.
+        selection.extend_to(8);
+        assert_eq!(members(&selection), vec![6, 7, 8]);
+    }
+
+    #[test]
+    fn clearing_drops_the_selection_and_the_anchor() {
+        let mut selection = CommitSelection::default();
+        selection.replace(1);
+        selection.extend_to(3);
+        selection.clear();
+        assert_eq!(members(&selection), Vec::<usize>::new());
+        assert_eq!(selection.anchor(), None);
+        assert_eq!(selection.len(), 0);
+    }
+
+    #[test]
+    fn a_restored_selection_keeps_its_members_and_anchor() {
+        let selection = CommitSelection::from_parts([5, 2, 3], Some(2));
+        assert_eq!(members(&selection), vec![2, 3, 5]);
+        assert_eq!(selection.anchor(), Some(2));
+
+        // Everything the reload dropped leaves nothing to anchor to.
+        let emptied = CommitSelection::from_parts([], Some(2));
+        assert_eq!(emptied.anchor(), None);
+    }
+
+    /// A keyboard extension steps in commit space, so a worktree row between two
+    /// commits is stepped straight over and the selection stays contiguous — which
+    /// is what the squash validator needs.
+    #[test]
+    fn a_selection_spanning_a_worktree_row_is_contiguous_in_commit_space() {
+        let commits = vec![
+            make_commit(3, &[2], vec![RefLabel::Head]),
+            make_commit(2, &[1], Vec::new()),
+            make_commit(1, &[], Vec::new()),
+        ];
+        let worktrees = vec![dirty_worktree("wip", Some(make_oid(2)), false)];
+        let worktree_rows = worktree_rows_for(&commits, &worktrees);
+        assert_eq!(worktree_rows, vec![1]);
+
+        let mut selection = CommitSelection::default();
+        selection.replace(0);
+        selection.extend_to(1);
+        assert_eq!(members(&selection), vec![0, 1]);
+
+        // The two selected commits are two rows apart because the worktree row
+        // sits between them, and neither maps onto that row.
+        let rows: Vec<usize> = selection
+            .iter()
+            .map(|commit_index| {
+                row_for_commit_index(&worktree_rows, commits.len(), commit_index)
+                    .expect("selected commits have rows")
+            })
+            .collect();
+        assert_eq!(rows, vec![0, 2]);
+        assert!(rows.iter().all(|row| !worktree_rows.contains(row)));
     }
 }

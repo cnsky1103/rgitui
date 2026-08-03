@@ -703,7 +703,12 @@ pub(super) fn subscribe_shortcuts_help(
 ) {
     cx.subscribe(
         shortcuts_help,
-        |_this, _sh, _event: &ShortcutsHelpEvent, _cx| {},
+        |this, _sh, event: &ShortcutsHelpEvent, cx| match event {
+            // Handled here rather than in the panel so a failure to create the
+            // file surfaces as a toast like every other error.
+            ShortcutsHelpEvent::OpenKeymapFile => this.open_keymap_file(cx),
+            ShortcutsHelpEvent::Dismissed => {}
+        },
     )
     .detach();
 }
@@ -1699,6 +1704,12 @@ pub(super) fn subscribe_graph(
     cx.subscribe(graph, {
         move |this, _graph, event: &GraphViewEvent, cx| {
             match event {
+                // Availability of the multi-commit operations follows the graph
+                // selection, so the palette context is refreshed here rather than
+                // only after a repository refresh.
+                GraphViewEvent::SelectionChanged => {
+                    this.update_command_context(cx);
+                }
                 GraphViewEvent::CommitSelected(oid) => {
                     let commit_oid = *oid;
                     log::info!("CommitSelected: oid={:.7}", commit_oid);
@@ -2130,6 +2141,10 @@ pub(super) fn subscribe_graph(
                             ir.show_visible(entries, format!("{} (rebase onto)", base_short), cx);
                         });
                 }
+                // The context-menu route to squashing. It lands on the same
+                // helper as the `graph::SquashSelected` keystroke, so the
+                // validation and the rejection wording cannot drift apart.
+                GraphViewEvent::SquashSelected => this.squash_selected_commits(cx),
             }
         }
     })

@@ -1,53 +1,39 @@
-use std::borrow::Cow;
+//! The keyboard shortcut reference, rendered from the keymap in force.
+//!
+//! Nothing here is a literal list of shortcuts. Every row comes from
+//! [`crate::keymap::summary`]: the description is the command's doc comment, the
+//! keystroke is what the user's `keymap.json` actually produced, a binding the
+//! user supplied is badged as such, and a binding that was dropped — because two
+//! of theirs collided, or because a keystroke now belongs to another command —
+//! is shown as a warning on the row it affects. Opening this panel is therefore
+//! how a user finds out *which* of their bindings was ignored and why.
+//!
+//! Rows also carry the informational notes: a panel binding winning a keystroke
+//! from a global one is legitimate scoping, so it is styled as an aside and is
+//! deliberately absent from the "with a problem" count in the header.
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight, KeyDownEvent, Render,
+    div, px, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight, Render, SharedString,
     Window,
 };
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
-use rgitui_ui::{Icon, IconName, IconSize, Label, LabelSize};
+use rgitui_ui::{
+    Badge, Button, ButtonSize, ButtonStyle, Icon, IconName, IconSize, Label, LabelSize,
+};
+
+use crate::keymap::{self, CommandBindings, CommandGroup, KeymapSummary, NoteSeverity};
+use crate::CommandId;
 
 #[derive(Debug, Clone)]
 pub enum ShortcutsHelpEvent {
     Dismissed,
+    /// The user asked to edit `keymap.json`; the workspace opens it.
+    OpenKeymapFile,
 }
 
-struct ShortcutCategory {
-    title: &'static str,
-    description: &'static str,
-    shortcuts: &'static [(&'static str, &'static str)],
-}
-
-/// Name of the platform's primary shortcut modifier, matching
-/// `gpui::Modifiers::secondary`: the Command key on macOS, Control elsewhere.
-const PRIMARY_MODIFIER: &str = if cfg!(target_os = "macos") {
-    "Cmd"
-} else {
-    "Ctrl"
-};
-
-/// Labels that stay on Control everywhere because macOS reserves the Command
-/// equivalent: Cmd+Tab is the application switcher and Cmd+H is Hide
-/// Application, both swallowed by the WindowServer before the app sees them.
-/// `key_handler` binds these to `modifiers.control` rather than the primary
-/// modifier, so the help must not promise Cmd.
-const PLATFORM_FIXED_LABELS: &[&str] = &["Ctrl+H", "Ctrl+Tab / Ctrl+Shift+Tab"];
-
-/// Free-form help copy that names a chord, and so has to track the platform's
-/// primary modifier just like the shortcut table does.
-const PALETTE_TIP: &str = "Tip: plain-letter shortcuts like d, b, h, j, and k depend on which panel is focused. Use Ctrl+Shift+P for less common actions like reflog, submodules, bisect, and stash management.";
-const MORE_ACTIONS_HINT: &str = "More actions: Ctrl+Shift+P";
-
-/// Rewrites the `Ctrl` chords in a shortcut label to the platform's primary
-/// modifier, so macOS shows `Cmd+Shift+P` rather than `Ctrl+Shift+P`.
-fn with_primary_modifier<'a>(label: &'a str, primary: &str) -> Cow<'a, str> {
-    if primary == "Ctrl" || !label.contains("Ctrl+") || PLATFORM_FIXED_LABELS.contains(&label) {
-        Cow::Borrowed(label)
-    } else {
-        Cow::Owned(label.replace("Ctrl+", &format!("{primary}+")))
-    }
-}
+/// Badge text marking a binding that came from the user's `keymap.json`.
+const USER_BINDING_BADGE: &str = "keymap.json";
 
 pub struct ShortcutsHelp {
     visible: bool,
@@ -87,113 +73,123 @@ impl ShortcutsHelp {
         cx.notify();
     }
 
-    fn handle_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.keystroke.key.as_str() == "escape" {
-            self.dismiss(cx);
-            cx.stop_propagation();
+    /// Runs a keyboard command scoped to `ShortcutsHelp`.
+    ///
+    /// Enter is not handled here: it is propagated so the focused field's own
+    /// submission fires exactly once.
+    fn dispatch_command(&mut self, cmd: CommandId, _window: &mut Window, cx: &mut Context<Self>) {
+        match cmd {
+            CommandId::Cancel => self.dismiss(cx),
+            _ => cx.propagate(),
         }
     }
 
-    fn shortcut_categories() -> Vec<ShortcutCategory> {
-        vec![
-            ShortcutCategory {
-                title: "Workspace",
-                description: "App-level actions available from anywhere outside active overlays.",
-                shortcuts: &[
-                    ("Ctrl+Shift+P", "Open command palette"),
-                    ("Ctrl+O", "Open repository"),
-                    ("Ctrl+H", "Go to workspace home"),
-                    ("Ctrl+W", "Close current tab"),
-                    ("Ctrl+,", "Open settings"),
-                    ("F5", "Refresh repository state"),
-                    ("?", "Open this help"),
-                ],
-            },
-            ShortcutCategory {
-                title: "Navigation",
-                description: "Focus a panel first. Plain-letter shortcuts are context-sensitive.",
-                shortcuts: &[
-                    ("j / k", "Move up / down in the focused panel"),
-                    ("g / G", "Jump to first / last item"),
-                    ("Tab / Shift+Tab", "Cycle focused panel"),
-                    ("Alt+1 / 2 / 3 / 4", "Focus sidebar / graph / detail / diff"),
-                    (
-                        "Alt+5 / 6 / 7",
-                        "Toggle issues / PRs / branch health panels",
+    /// Renders one command's row: what it does, what it is bound to, where that
+    /// binding came from and anything wrong with it.
+    fn render_command(&self, entry: &CommandBindings, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.colors().clone();
+        let hover_bg = colors.ghost_element_hover;
+        let is_user_defined = entry.is_user_defined();
+        let keystrokes = entry.display();
+
+        let mut row = div()
+            .v_flex()
+            .w_full()
+            .py(px(5.))
+            .px(px(4.))
+            .rounded(px(4.))
+            .gap(px(3.))
+            .hover(move |s| s.bg(hover_bg));
+
+        let mut headline = div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .items_center()
+            .gap(px(10.))
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(SharedString::from(entry.command.description()))
+                        .size(LabelSize::Small)
+                        .color(if keystrokes.is_some() {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        }),
+                ),
+            );
+
+        if is_user_defined {
+            headline = headline.child(
+                div()
+                    .flex_shrink_0()
+                    .child(Badge::new(USER_BINDING_BADGE).color(Color::Info)),
+            );
+        }
+
+        headline = match keystrokes {
+            Some(keystrokes) => headline.child(
+                div()
+                    .h_flex()
+                    .flex_shrink_0()
+                    .h(px(24.))
+                    .px(px(10.))
+                    .gap_1()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(if is_user_defined {
+                        Color::Info.color(cx)
+                    } else {
+                        colors.border
+                    })
+                    .bg(colors.hint_background)
+                    .items_center()
+                    .child(
+                        Label::new(SharedString::from(keystrokes))
+                            .size(LabelSize::Small)
+                            .weight(FontWeight::BOLD)
+                            .color(Color::Default),
                     ),
-                    ("Alt+8", "Toggle stashes panel"),
-                    ("Ctrl+Shift+T / Alt+9", "Open theme editor"),
-                    ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
-                    ("v", "Toggle changed-files view (flat / tree)"),
-                    ("Enter / Space", "Activate selected sidebar item"),
-                ],
-            },
-            ShortcutCategory {
-                title: "Views & Search",
-                description: "Fast access to panels and graph-specific tools.",
-                shortcuts: &[
-                    ("Ctrl+F", "Toggle commit graph search"),
-                    ("Ctrl+Shift+F", "Toggle global search across the repository"),
-                    ("/", "Start in-graph search"),
-                    ("d", "Toggle diff mode (unified / split)"),
-                    ("b", "Toggle blame view for selected file"),
-                    ("h", "Toggle file history view for selected file"),
-                    ("y", "Copy SHA of selected commit"),
-                    ("Shift+C", "Copy commit message of selected commit"),
-                    (
-                        "Mouse drag / Shift+click",
-                        "Select lines in the diff viewer",
+            ),
+            None => headline.child(
+                div().flex_shrink_0().child(
+                    Label::new(keymap::display::UNBOUND)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Placeholder),
+                ),
+            ),
+        };
+
+        row = row.child(headline);
+
+        for note in &entry.notes {
+            // Info notes are the deliberate deeper-wins scoping the defaults rely
+            // on, so they read as an aside rather than as something to fix.
+            let (icon, color) = match note.severity {
+                NoteSeverity::Warning => (IconName::AlertTriangle, Color::Warning),
+                NoteSeverity::Info => (IconName::Info, Color::Muted),
+            };
+            row = row.child(
+                div()
+                    .h_flex()
+                    .w_full()
+                    .gap(px(6.))
+                    .items_start()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(SharedString::from(note.message.clone()))
+                                .size(LabelSize::XSmall)
+                                .color(color),
+                        ),
                     ),
-                    ("Ctrl+C", "Copy selected diff lines"),
-                    ("Esc", "Close the active overlay or modal"),
-                ],
-            },
-            ShortcutCategory {
-                title: "Git & AI",
-                description:
-                    "Common write actions. More advanced operations live in the command palette.",
-                shortcuts: &[
-                    ("Ctrl+Shift+R", "Fetch"),
-                    ("Ctrl+S", "Stage all changes"),
-                    ("Ctrl+Shift+S / Ctrl+U", "Unstage all changes"),
-                    ("Ctrl+Enter", "Commit"),
-                    ("Ctrl+B", "Create branch"),
-                    ("Ctrl+Shift+B", "Switch branch (focus sidebar)"),
-                    ("Ctrl+Z / Ctrl+Shift+Z", "Stash changes / pop stash"),
-                    ("Ctrl+G", "Generate AI commit message"),
-                    ("s", "Stage / unstage selected file in sidebar"),
-                    (
-                        "Alt+S / Alt+U",
-                        "Stage / unstage current hunk in diff viewer",
-                    ),
-                    ("p", "Toggle partial (line-selection) staging mode"),
-                    (
-                        "s / u",
-                        "Stage / unstage hunks under selection (or cursor hunk)",
-                    ),
-                    ("x / Delete", "Discard selected sidebar item"),
-                ],
-            },
-        ]
+            );
+        }
+
+        row
     }
 
-    fn shortcut_count(categories: &[ShortcutCategory]) -> usize {
-        categories
-            .iter()
-            .map(|category| category.shortcuts.len())
-            .sum()
-    }
-
-    fn render_category(
-        &self,
-        category: &ShortcutCategory,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_group(&self, group: &CommandGroup, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.colors().clone();
         let border_variant = colors.border_variant;
 
@@ -208,63 +204,44 @@ impl ShortcutsHelp {
                         .v_flex()
                         .gap(px(4.))
                         .child(
-                            Label::new(category.title)
+                            Label::new(group.view)
                                 .size(LabelSize::Small)
                                 .weight(FontWeight::SEMIBOLD)
                                 .color(Color::Accent),
                         )
                         .child(
-                            Label::new(category.description)
-                                .size(LabelSize::Small)
+                            Label::new(SharedString::from(group.description()))
+                                .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         ),
                 ),
         );
 
-        for (key, desc) in category.shortcuts {
-            let hover_bg = colors.ghost_element_hover;
-            col = col.child(
-                div()
-                    .h_flex()
-                    .w_full()
-                    .py(px(5.))
-                    .px(px(4.))
-                    .rounded(px(4.))
-                    .items_center()
-                    .gap(px(16.))
-                    .hover(move |s| s.bg(hover_bg))
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Label::new(*desc)
-                                .size(LabelSize::Small)
-                                .color(Color::Default),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .h_flex()
-                            .flex_shrink_0()
-                            .h(px(24.))
-                            .px(px(10.))
-                            .gap_1()
-                            .rounded(px(5.))
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.hint_background)
-                            .items_center()
-                            .child(
-                                Label::new(
-                                    with_primary_modifier(key, PRIMARY_MODIFIER).into_owned(),
-                                )
-                                .size(LabelSize::Small)
-                                .weight(FontWeight::BOLD)
-                                .color(Color::Default),
-                            ),
-                    ),
-            );
+        for entry in &group.commands {
+            col = col.child(self.render_command(entry, cx));
         }
 
         col
+    }
+
+    /// The header summary line, counted from the keymap rather than written out.
+    fn subtitle(summary: &KeymapSummary) -> String {
+        let mut parts = vec![format!(
+            "{} of {} commands are bound",
+            summary.bound_command_count(),
+            summary.commands().len()
+        )];
+        let user_bindings = summary.user_binding_count();
+        if user_bindings > 0 {
+            parts.push(format!("{user_bindings} from your keymap.json",));
+        }
+        let warnings = summary.warning_count();
+        if warnings > 0 {
+            parts.push(format!(
+                "{warnings} with a problem — see the warnings below",
+            ));
+        }
+        parts.join(", ")
     }
 }
 
@@ -274,8 +251,11 @@ impl Render for ShortcutsHelp {
             return div().id("shortcuts-help").into_any_element();
         }
 
-        let categories = Self::shortcut_categories();
-        let total_shortcuts = Self::shortcut_count(&categories);
+        let summary = keymap::summary(cx);
+        let groups = summary.groups();
+        let subtitle = Self::subtitle(&summary);
+        let palette_hint = keymap::shortcut(CommandId::CommandPalette, cx);
+        let keymap_file = keymap::keymap_path().display().to_string();
 
         let colors = cx.colors().clone();
         let viewport = window.viewport_size();
@@ -285,15 +265,28 @@ impl Render for ShortcutsHelp {
         let modal_height = px((viewport_height - 32.0).clamp(280.0, 720.0));
         let use_two_columns = viewport_width >= 960.0;
 
+        // Split the groups into two balanced columns by row count, so a long
+        // block like `Workspace` does not leave the second column empty.
         let body = if use_two_columns {
+            let total: usize = groups.iter().map(|group| group.commands.len()).sum();
+            let mut running = 0usize;
+            let split = groups
+                .iter()
+                .position(|group| {
+                    running += group.commands.len();
+                    running * 2 >= total
+                })
+                .map_or(groups.len(), |index| index + 1)
+                .min(groups.len());
+
             let mut left_col = div().v_flex().flex_1().min_w_0().gap(px(16.));
-            for category in &categories[..2] {
-                left_col = left_col.child(self.render_category(category, cx));
+            for group in &groups[..split] {
+                left_col = left_col.child(self.render_group(group, cx));
             }
 
             let mut right_col = div().v_flex().flex_1().min_w_0().gap(px(16.));
-            for category in &categories[2..] {
-                right_col = right_col.child(self.render_category(category, cx));
+            for group in &groups[split..] {
+                right_col = right_col.child(self.render_group(group, cx));
             }
 
             div()
@@ -312,8 +305,8 @@ impl Render for ShortcutsHelp {
                 .into_any_element()
         } else {
             let mut column = div().v_flex().w_full().gap(px(16.));
-            for category in &categories {
-                column = column.child(self.render_category(category, cx));
+            for group in &groups {
+                column = column.child(self.render_group(group, cx));
             }
 
             div()
@@ -351,7 +344,9 @@ impl Render for ShortcutsHelp {
         let modal = div()
             .id("shortcuts-help-container")
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::handle_key_down))
+            .map(|el| {
+                keymap::bind_actions(el, "ShortcutsHelp", &["Menu"], cx, Self::dispatch_command)
+            })
             .v_flex()
             .w(modal_width)
             .h(modal_height)
@@ -374,6 +369,7 @@ impl Render for ShortcutsHelp {
                     .border_b_1()
                     .border_color(colors.border_variant)
                     .justify_between()
+                    .gap(px(10.))
                     .child(
                         div()
                             .h_flex()
@@ -397,15 +393,23 @@ impl Render for ShortcutsHelp {
                                             .weight(FontWeight::SEMIBOLD),
                                     )
                                     .child(
-                                        Label::new(format!(
-                                            "{} shortcuts across navigation, views, workspace, and git actions",
-                                            total_shortcuts
-                                        ))
-                                        .size(LabelSize::XSmall)
-                                        .truncate()
-                                        .color(Color::Muted),
+                                        Label::new(SharedString::from(subtitle))
+                                            .size(LabelSize::XSmall)
+                                            .truncate()
+                                            .color(Color::Muted),
                                     ),
                             ),
+                    )
+                    .child(
+                        Button::new("shortcuts-open-keymap", "Edit keymap.json")
+                            .style(ButtonStyle::Subtle)
+                            .size(ButtonSize::Compact)
+                            .icon(IconName::Settings)
+                            .tooltip(SharedString::from(keymap_file))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                cx.emit(ShortcutsHelpEvent::OpenKeymapFile);
+                                this.dismiss(cx);
+                            })),
                     )
                     .child(
                         div()
@@ -429,28 +433,32 @@ impl Render for ShortcutsHelp {
                     ),
             )
             .child(
-                div()
-                    .w_full()
-                    .px(px(16.))
-                    .pt(px(12.))
-                    .child(
-                        div()
-                            .w_full()
-                            .rounded(px(8.))
-                            .bg(colors.surface_background)
-                            .border_1()
-                            .border_color(colors.border_variant)
-                            .px(px(12.))
-                            .py(px(10.))
-                            .child(
-                                Label::new(
-                                    with_primary_modifier(PALETTE_TIP, PRIMARY_MODIFIER)
-                                        .into_owned(),
-                                )
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                            ),
-                    ),
+                div().w_full().px(px(16.)).pt(px(12.)).child(
+                    div()
+                        .w_full()
+                        .rounded(px(8.))
+                        .bg(colors.surface_background)
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .px(px(12.))
+                        .py(px(10.))
+                        .child(
+                            Label::new(SharedString::from(format!(
+                                "Every shortcut below is rebindable, and each is shown as your \
+                                     keymap.json leaves it. Plain-letter shortcuts only act on the \
+                                     panel that has focus — that is what each group's key context \
+                                     means. Commands marked {} have no keystroke and are reached \
+                                     from the command palette{}.",
+                                keymap::display::UNBOUND,
+                                palette_hint
+                                    .as_deref()
+                                    .map(|hint| format!(" ({hint})"))
+                                    .unwrap_or_default(),
+                            )))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        ),
+                ),
             )
             .child(body)
             .child(
@@ -469,16 +477,16 @@ impl Render for ShortcutsHelp {
                             .size(LabelSize::XSmall)
                             .color(Color::Placeholder),
                     )
-                    .when(viewport_width >= 520.0, |footer| {
-                        footer.child(
-                            Label::new(
-                                with_primary_modifier(MORE_ACTIONS_HINT, PRIMARY_MODIFIER)
-                                    .into_owned(),
+                    .when_some(
+                        palette_hint.filter(|_| viewport_width >= 520.0),
+                        |footer, hint| {
+                            footer.child(
+                                Label::new(SharedString::from(format!("More actions: {hint}")))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
                             )
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                        )
-                    }),
+                        },
+                    ),
             );
 
         backdrop.child(modal).into_any_element()
@@ -488,6 +496,12 @@ impl Render for ShortcutsHelp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::conflict::BindingSpec;
+    use crate::keymap::display::KeystrokeStyle;
+
+    fn defaults() -> KeymapSummary {
+        KeymapSummary::defaults(KeystrokeStyle::Words)
+    }
 
     #[test]
     fn test_shortcuts_help_event_debug() {
@@ -497,79 +511,87 @@ mod tests {
 
     #[test]
     fn test_shortcuts_help_event_match() {
-        let event = ShortcutsHelpEvent::Dismissed;
-        match event {
+        match ShortcutsHelpEvent::Dismissed {
             ShortcutsHelpEvent::Dismissed => {}
+            ShortcutsHelpEvent::OpenKeymapFile => unreachable!(),
         }
     }
 
+    /// Every group the view renders has a heading, a derived key-context blurb
+    /// and at least one row, so no group can render as an empty box.
     #[test]
-    fn primary_modifier_rewrites_every_ctrl_chord_on_macos() {
-        assert_eq!(with_primary_modifier("Ctrl+Shift+P", "Cmd"), "Cmd+Shift+P");
-        assert_eq!(
-            with_primary_modifier("Ctrl+Z / Ctrl+Shift+Z", "Cmd"),
-            "Cmd+Z / Cmd+Shift+Z"
-        );
-    }
-
-    #[test]
-    fn primary_modifier_leaves_labels_untouched_elsewhere() {
-        assert_eq!(
-            with_primary_modifier("Ctrl+Shift+P", "Ctrl"),
-            "Ctrl+Shift+P"
-        );
-        assert_eq!(
-            with_primary_modifier("Alt+1 / 2 / 3 / 4", "Cmd"),
-            "Alt+1 / 2 / 3 / 4"
-        );
-        assert_eq!(with_primary_modifier("j / k", "Cmd"), "j / k");
-    }
-
-    #[test]
-    fn every_documented_shortcut_label_is_platform_correct() {
-        let categories = ShortcutsHelp::shortcut_categories();
-        let table = categories
-            .iter()
-            .flat_map(|category| category.shortcuts.iter().map(|(label, _)| *label));
-
-        for label in table.chain([PALETTE_TIP, MORE_ACTIONS_HINT]) {
-            let rendered = with_primary_modifier(label, PRIMARY_MODIFIER);
-            if PRIMARY_MODIFIER == "Cmd" && !PLATFORM_FIXED_LABELS.contains(&label) {
+    fn every_group_has_a_heading_and_rows() {
+        let summary = defaults();
+        let groups = summary.groups();
+        assert!(!groups.is_empty());
+        for group in &groups {
+            assert!(!group.view.is_empty());
+            assert!(!group.description().is_empty());
+            assert!(!group.commands.is_empty(), "{} is empty", group.view);
+            for entry in &group.commands {
                 assert!(
-                    !rendered.contains("Ctrl+"),
-                    "label {label:?} still advertises Ctrl on a Cmd platform"
+                    !entry.command.description().is_empty(),
+                    "{} has no description to render",
+                    entry.command
                 );
-            } else {
-                assert_eq!(rendered, label);
             }
         }
     }
 
+    /// The old hand-written table advertised `Ctrl+Shift+F` for Fetch while the
+    /// keymap bound `Ctrl+Shift+R`. The row now comes from the keymap, so the
+    /// two cannot differ.
     #[test]
-    fn os_reserved_chords_keep_control_on_every_platform() {
-        for label in PLATFORM_FIXED_LABELS {
-            assert_eq!(
-                with_primary_modifier(label, "Cmd"),
-                *label,
-                "{label:?} is bound to Control in key_handler, so the help must not promise Cmd"
-            );
-        }
+    fn a_row_shows_the_keystroke_the_keymap_binds() {
+        let summary = defaults();
+        assert_eq!(
+            summary.display(CommandId::Fetch),
+            crate::keymap::humanize_sequence(
+                CommandId::Fetch.default_bindings()[0].0,
+                KeystrokeStyle::Words
+            )
+        );
     }
 
     #[test]
-    fn platform_fixed_labels_all_appear_in_the_shortcut_table() {
-        let categories = ShortcutsHelp::shortcut_categories();
-        let documented: Vec<&str> = categories
-            .iter()
-            .flat_map(|category| category.shortcuts.iter().map(|(label, _)| *label))
-            .collect();
+    fn the_subtitle_counts_what_the_keymap_holds() {
+        let summary = defaults();
+        let subtitle = ShortcutsHelp::subtitle(&summary);
+        assert!(
+            subtitle.contains(&summary.bound_command_count().to_string()),
+            "{subtitle}"
+        );
+        // Nothing to warn about and nothing user-defined in the defaults.
+        assert!(!subtitle.contains("keymap.json"), "{subtitle}");
+        assert!(!subtitle.contains("problem"), "{subtitle}");
+    }
 
-        for label in PLATFORM_FIXED_LABELS {
-            assert!(
-                documented.contains(label),
-                "{label:?} is exempted from the Cmd rewrite but no longer appears in the table; \
-                 the exemption is stale"
-            );
-        }
+    /// A user binding and a conflict both have to be visible in the panel: the
+    /// badge comes from `is_user_defined`, the warning row from `warnings`.
+    #[test]
+    fn the_subtitle_and_rows_surface_user_bindings_and_conflicts() {
+        let mut specs = crate::keymap::loader::default_specs();
+        specs.push(BindingSpec::user_binding(
+            "ctrl-alt-9",
+            Some("Workspace"),
+            "rgitui::Pull",
+        ));
+        specs.push(BindingSpec::user_binding(
+            "ctrl-alt-9",
+            Some("Workspace"),
+            "rgitui::Push",
+        ));
+        let report = crate::keymap::conflict::detect_conflicts(&specs);
+        let applied: Vec<usize> = (0..specs.len()).filter(|i| report.is_kept(*i)).collect();
+        let summary = KeymapSummary::build(&specs, &applied, &report, KeystrokeStyle::Words);
+
+        let subtitle = ShortcutsHelp::subtitle(&summary);
+        assert!(subtitle.contains("keymap.json"), "{subtitle}");
+        assert!(subtitle.contains("problem"), "{subtitle}");
+
+        // Push won, so it carries the badge; Pull lost, so it carries the warning.
+        assert!(summary.is_user_defined(CommandId::Push));
+        assert_eq!(summary.warnings(CommandId::Pull).len(), 1);
+        assert!(summary.warnings(CommandId::Pull)[0].contains("ignored"));
     }
 }
