@@ -122,11 +122,11 @@ impl Workspace {
         }
 
         // Ctrl+Shift+T to open theme editor (Ctrl+9 as alternative)
-        if (modifiers.control || modifiers.platform) && modifiers.shift && key == "t" {
+        if modifiers.secondary() && modifiers.shift && key == "t" {
             self.execute_command(CommandId::OpenThemeEditor, cx);
             return;
         }
-        if modifiers.alt && !modifiers.control && key == "9" {
+        if modifiers.alt && !modifiers.secondary() && key == "9" {
             self.execute_command(CommandId::OpenThemeEditor, cx);
             return;
         }
@@ -151,11 +151,7 @@ impl Workspace {
             || self.overlays.shortcuts_help.read(cx).is_visible();
 
         // Ctrl+Shift+F to toggle global search
-        if !any_overlay_active
-            && (modifiers.control || modifiers.platform)
-            && modifiers.shift
-            && key == "f"
-        {
+        if !any_overlay_active && modifiers.secondary() && modifiers.shift && key == "f" {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 if tab.bottom_panel_mode == BottomPanelMode::GlobalSearch {
                     tab.global_search_view
@@ -173,21 +169,13 @@ impl Workspace {
         }
 
         // Ctrl+Shift+R to fetch
-        if !any_overlay_active
-            && (modifiers.control || modifiers.platform)
-            && modifiers.shift
-            && key == "r"
-        {
+        if !any_overlay_active && modifiers.secondary() && modifiers.shift && key == "r" {
             self.execute_command(CommandId::Fetch, cx);
             return;
         }
 
         // Ctrl+F to toggle graph search
-        if !any_overlay_active
-            && (modifiers.control || modifiers.platform)
-            && !modifiers.shift
-            && key == "f"
-        {
+        if !any_overlay_active && modifiers.secondary() && !modifiers.shift && key == "f" {
             if let Some(tab) = self.tabs.get(self.active_tab) {
                 let graph = tab.graph.clone();
                 graph.update(cx, |g, cx| {
@@ -209,17 +197,13 @@ impl Workspace {
         }
 
         // Ctrl+G to generate AI commit message
-        if !any_overlay_active
-            && (modifiers.control || modifiers.platform)
-            && !modifiers.shift
-            && key == "g"
-        {
+        if !any_overlay_active && modifiers.secondary() && !modifiers.shift && key == "g" {
             self.execute_command(CommandId::AiMessage, cx);
             return;
         }
 
         // Ctrl+Shift+P or Cmd+Shift+P to open command palette
-        if (modifiers.control || modifiers.platform) && modifiers.shift && key == "p" {
+        if modifiers.secondary() && modifiers.shift && key == "p" {
             self.save_focus(window, cx);
             self.overlays.command_palette.update(cx, |cp, cx| {
                 cp.toggle(window, cx);
@@ -228,7 +212,7 @@ impl Workspace {
         }
 
         // Ctrl+, to open settings
-        if (modifiers.control || modifiers.platform) && key == "," {
+        if modifiers.secondary() && key == "," {
             self.save_focus(window, cx);
             self.open_or_focus_settings(cx);
             return;
@@ -240,7 +224,7 @@ impl Workspace {
         }
 
         // Ctrl+O to open repo opener
-        if (modifiers.control || modifiers.platform) && key == "o" {
+        if modifiers.secondary() && key == "o" {
             self.save_focus(window, cx);
             self.overlays.repo_opener.update(cx, |ro, cx| {
                 ro.toggle(window, cx);
@@ -420,7 +404,7 @@ impl Workspace {
         }
 
         // Ctrl+[ / Ctrl+] to resize detail panel width
-        if !any_overlay_active && modifiers.control && !modifiers.shift && !modifiers.alt {
+        if !any_overlay_active && modifiers.secondary() && !modifiers.shift && !modifiers.alt {
             match key {
                 "[" | "bracketleft" => {
                     self.layout.detail_panel_width = (self.layout.detail_panel_width - 20.0)
@@ -452,62 +436,57 @@ impl Workspace {
         }
 
         // Ctrl+S to stage all
-        if !any_overlay_active && modifiers.control && !modifiers.shift && key == "s" {
+        if !any_overlay_active && modifiers.secondary() && !modifiers.shift && key == "s" {
             self.execute_command(CommandId::StageAll, cx);
             return;
         }
 
         // Ctrl+Shift+S to unstage all
-        if !any_overlay_active && modifiers.control && modifiers.shift && key == "s" {
+        if !any_overlay_active && modifiers.secondary() && modifiers.shift && key == "s" {
             self.execute_command(CommandId::UnstageAll, cx);
             return;
         }
 
         // Ctrl+U to unstage all (alternative)
-        if !any_overlay_active
-            && (modifiers.control || modifiers.platform)
-            && !modifiers.shift
-            && key == "u"
-        {
+        if !any_overlay_active && modifiers.secondary() && !modifiers.shift && key == "u" {
             self.execute_command(CommandId::UnstageAll, cx);
             return;
         }
 
         // Ctrl+B to create branch
-        if !any_overlay_active && modifiers.control && !modifiers.shift && key == "b" {
+        if !any_overlay_active && modifiers.secondary() && !modifiers.shift && key == "b" {
             self.execute_command(CommandId::CreateBranch, cx);
             return;
         }
 
         // Ctrl+Shift+B to switch branch (focus sidebar for branch navigation)
-        if !any_overlay_active
-            && (modifiers.control || modifiers.platform)
-            && modifiers.shift
-            && key == "b"
-        {
+        if !any_overlay_active && modifiers.secondary() && modifiers.shift && key == "b" {
             self.focus_panel(FocusedPanel::Sidebar, window, cx);
             return;
         }
 
         // Ctrl+Enter to commit
-        if !any_overlay_active && modifiers.control && !modifiers.shift && key == "enter" {
+        if !any_overlay_active && modifiers.secondary() && !modifiers.shift && key == "enter" {
             self.execute_command(CommandId::Commit, cx);
             return;
         }
 
         // Ctrl+Z to stash save
-        if !any_overlay_active && modifiers.control && !modifiers.shift && key == "z" {
+        if !any_overlay_active && modifiers.secondary() && !modifiers.shift && key == "z" {
             self.execute_command(CommandId::StashSave, cx);
             return;
         }
 
         // Ctrl+Shift+Z to stash pop
-        if !any_overlay_active && modifiers.control && modifiers.shift && key == "z" {
+        if !any_overlay_active && modifiers.secondary() && modifiers.shift && key == "z" {
             self.execute_command(CommandId::StashPop, cx);
             return;
         }
 
-        // Ctrl+Tab to switch to next tab
+        // Ctrl+Tab to switch to next tab. Deliberately not the primary
+        // modifier: macOS reserves Cmd+Tab for the application switcher, so the
+        // WindowServer swallows it before the app sees it. Ctrl+Tab is also the
+        // native tab-cycling chord there.
         if !any_overlay_active && modifiers.control && !modifiers.shift && key == "tab" {
             if !self.tabs.is_empty() {
                 self.active_tab = (self.active_tab + 1) % self.tabs.len();
@@ -516,7 +495,8 @@ impl Workspace {
             return;
         }
 
-        // Ctrl+Shift+Tab to switch to previous tab
+        // Ctrl+Shift+Tab to switch to previous tab. Ctrl for the same reason as
+        // Ctrl+Tab above.
         if !any_overlay_active && modifiers.control && modifiers.shift && key == "tab" {
             if !self.tabs.is_empty() {
                 if self.active_tab == 0 {
@@ -530,25 +510,22 @@ impl Workspace {
         }
 
         // Ctrl+W to close current tab
-        if !any_overlay_active && modifiers.control && !modifiers.shift && key == "w" {
+        if !any_overlay_active && modifiers.secondary() && !modifiers.shift && key == "w" {
             if !self.tabs.is_empty() {
                 self.close_tab(self.active_tab, cx);
             }
             return;
         }
 
-        // Ctrl+H to return to workspace home
-        if !any_overlay_active
-            && (modifiers.control || modifiers.platform)
-            && !modifiers.shift
-            && key == "h"
-        {
+        // Ctrl+H to return to workspace home. Deliberately not the primary
+        // modifier: macOS reserves Cmd+H for Hide Application.
+        if !any_overlay_active && modifiers.control && !modifiers.shift && key == "h" {
             self.go_home(cx);
             return;
         }
 
         // Alt+1/2/3/4 to focus sidebar/graph/detail/diff panel
-        if !any_overlay_active && modifiers.alt && !modifiers.control {
+        if !any_overlay_active && modifiers.alt && !modifiers.secondary() {
             match key {
                 "1" => {
                     self.focus_panel(FocusedPanel::Sidebar, window, cx);
@@ -587,7 +564,7 @@ impl Workspace {
         }
 
         // Tab / Shift+Tab to cycle between panels (only when no overlay is active)
-        if !any_overlay_active && !modifiers.control && !modifiers.alt && key == "tab" {
+        if !any_overlay_active && !modifiers.secondary() && !modifiers.alt && key == "tab" {
             if modifiers.shift {
                 self.focus_prev_panel(window, cx);
             } else {
