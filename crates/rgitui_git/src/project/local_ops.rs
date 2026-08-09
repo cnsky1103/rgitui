@@ -3618,97 +3618,51 @@ fn count_would_remove(stdout: &str) -> usize {
 mod tests {
     use std::fs;
 
-    use tempfile::TempDir;
+    use rgitui_test_support::TempRepo;
 
-    /// Make a test repo with a single empty commit, returning (tempdir, repo_path, head_oid).
-    fn make_test_repo() -> (TempDir, std::path::PathBuf, git2::Oid) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().to_path_buf();
-        let repo = git2::Repository::init(&path).unwrap();
-
-        let mut config = repo.config().unwrap();
-        config.set_str("user.name", "Test").unwrap();
-        config.set_str("user.email", "test@test.com").unwrap();
-        drop(config);
-
-        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
-        let tree_oid = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-
-        let oid = repo
-            .commit(
-                Some("refs/heads/main"),
-                &sig,
-                &sig,
-                "initial commit",
-                &tree,
-                &[],
-            )
-            .unwrap();
-
-        // Set HEAD explicitly so push_head() in collect_commits() works
-        // regardless of init.defaultBranch (Windows defaults to master)
-        repo.set_head("refs/heads/main").unwrap();
-
-        (dir, path, oid)
+    /// A repo whose single commit has an empty tree, so a test is free to create
+    /// and stage `file.txt` itself without colliding with an existing entry.
+    fn make_test_repo() -> TempRepo {
+        let repo = TempRepo::init();
+        repo.commit("initial commit");
+        repo
     }
 
     /// Make a repo whose `feature` branch adds `path_in_repo`, with HEAD left on
     /// `main` one commit behind and the file absent from the work tree — the
     /// shape a fast-forward merge sees.
-    fn make_repo_with_ff_branch(
-        path_in_repo: &str,
-        contents: &str,
-    ) -> (TempDir, std::path::PathBuf) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().to_path_buf();
-        let repo = git2::Repository::init(&path).unwrap();
+    fn make_repo_with_ff_branch(path_in_repo: &str, contents: &str) -> TempRepo {
+        let fixture = TempRepo::init();
+        let base = fixture.commit("initial");
 
-        let mut config = repo.config().unwrap();
-        config.set_str("user.name", "Test").unwrap();
-        config.set_str("user.email", "test@test.com").unwrap();
-        // Keep checkout byte-exact so the assertions hold wherever the suite
-        // runs; the machine's global core.autocrlf would otherwise rewrite
-        // line endings on Windows.
-        config.set_bool("core.autocrlf", false).unwrap();
-        drop(config);
+        // Scoped so every borrow of `fixture` — and every libgit2 handle with a
+        // `Drop` that keeps one alive — is released before the fixture moves out.
+        {
+            let repo = fixture.repo();
+            // Build the branch commit straight from a tree so the work tree
+            // keeps looking like `main`.
+            let blob = repo.blob(contents.as_bytes()).unwrap();
+            let mut builder = repo.treebuilder(None).unwrap();
+            builder.insert(path_in_repo, blob, 0o100644).unwrap();
+            let branch_tree_oid = builder.write().unwrap();
+            fixture.commit_tree(
+                Some("refs/heads/feature"),
+                "add file",
+                branch_tree_oid,
+                &[base],
+            );
+        }
 
-        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
-        let tree_oid = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-        let base = repo
-            .commit(Some("refs/heads/main"), &sig, &sig, "initial", &tree, &[])
-            .unwrap();
-        repo.set_head("refs/heads/main").unwrap();
-
-        // Build the branch commit straight from a tree so the work tree keeps
-        // looking like `main`.
-        let blob = repo.blob(contents.as_bytes()).unwrap();
-        let mut builder = repo.treebuilder(None).unwrap();
-        builder.insert(path_in_repo, blob, 0o100644).unwrap();
-        let branch_tree_oid = builder.write().unwrap();
-        let branch_tree = repo.find_tree(branch_tree_oid).unwrap();
-        let parent = repo.find_commit(base).unwrap();
-        repo.commit(
-            Some("refs/heads/feature"),
-            &sig,
-            &sig,
-            "add file",
-            &branch_tree,
-            &[&parent],
-        )
-        .unwrap();
-
-        (dir, path)
+        fixture
     }
 
     #[test]
     fn checkout_tree_safe_refuses_to_clobber_an_untracked_file() {
-        let (dir, path) = make_repo_with_ff_branch("notes.txt", "FROM BRANCH\n");
-        let untracked = dir.path().join("notes.txt");
+        let fixture = make_repo_with_ff_branch("notes.txt", "FROM BRANCH\n");
+        let untracked = fixture.path().join("notes.txt");
         fs::write(&untracked, "PRECIOUS UNTRACKED\n").unwrap();
 
-        let repo = git2::Repository::open(&path).unwrap();
+        let repo = git2::Repository::open(fixture.path()).unwrap();
         let target = repo.revparse_single("refs/heads/feature").unwrap();
         let err = super::checkout_tree_safe(&repo, &target, "Merge").unwrap_err();
 
@@ -3730,14 +3684,14 @@ mod tests {
 
     #[test]
     fn checkout_tree_safe_applies_when_nothing_collides() {
-        let (dir, path) = make_repo_with_ff_branch("notes.txt", "FROM BRANCH\n");
+        let fixture = make_repo_with_ff_branch("notes.txt", "FROM BRANCH\n");
 
-        let repo = git2::Repository::open(&path).unwrap();
+        let repo = git2::Repository::open(fixture.path()).unwrap();
         let target = repo.revparse_single("refs/heads/feature").unwrap();
         super::checkout_tree_safe(&repo, &target, "Merge").unwrap();
 
         assert_eq!(
-            fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            fs::read_to_string(fixture.path().join("notes.txt")).unwrap(),
             "FROM BRANCH\n"
         );
     }
@@ -3753,48 +3707,6 @@ mod tests {
         );
     }
 
-    /// Make a test repo with n commits, returning (tempdir, repo_path, tip_oid).
-    fn make_test_repo_with_commits(n: usize) -> (TempDir, std::path::PathBuf, git2::Oid) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().to_path_buf();
-        let repo = git2::Repository::init(&path).unwrap();
-
-        let mut config = repo.config().unwrap();
-        config.set_str("user.name", "Test").unwrap();
-        config.set_str("user.email", "test@test.com").unwrap();
-        drop(config);
-
-        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
-        let mut last_oid = git2::Oid::zero();
-
-        for i in 0..n {
-            let parents: Vec<git2::Commit> = if i == 0 {
-                vec![]
-            } else {
-                vec![repo.find_commit(last_oid).unwrap()]
-            };
-            let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-            let tree_oid = repo.index().unwrap().write_tree().unwrap();
-            let tree = repo.find_tree(tree_oid).unwrap();
-            last_oid = repo
-                .commit(
-                    Some("refs/heads/main"),
-                    &sig,
-                    &sig,
-                    &format!("commit {}", i),
-                    &tree,
-                    &parent_refs,
-                )
-                .unwrap();
-        }
-
-        // Set HEAD explicitly so push_head() in collect_commits() works
-        // regardless of init.defaultBranch (Windows defaults to master)
-        repo.set_head("refs/heads/main").unwrap();
-
-        (dir, path, last_oid)
-    }
-
     /// Collect commits via revwalk.  index 0 = newest.
     fn collect_commits(repo: &git2::Repository) -> Vec<git2::Oid> {
         let mut rw = repo.revwalk().unwrap();
@@ -3808,8 +3720,9 @@ mod tests {
 
     #[test]
     fn stash_save_and_pop() {
-        let (_dir, path, _oid) = make_test_repo();
-        let mut repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let mut repo = git2::Repository::open(path).unwrap();
 
         fs::write(path.join("file.txt"), "hello").unwrap();
         repo.index()
@@ -3832,8 +3745,9 @@ mod tests {
     #[test]
     #[ignore = "git2's stash_apply requires clean index+working-tree AND checks index state match; the stash index differs from post-reset index causing 'uncommitted changes' error. Test git2 semantics, not application behavior."]
     fn stash_apply_keeps_stash() {
-        let (_dir, path, _oid) = make_test_repo();
-        let mut repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let mut repo = git2::Repository::open(path).unwrap();
 
         fs::write(path.join("file.txt"), "hello").unwrap();
         repo.index()
@@ -3885,8 +3799,9 @@ mod tests {
 
     #[test]
     fn stash_drop_removes_entry() {
-        let (_dir, path, _oid) = make_test_repo();
-        let mut repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let mut repo = git2::Repository::open(path).unwrap();
 
         fs::write(path.join("file.txt"), "changes").unwrap();
         repo.index()
@@ -3906,8 +3821,9 @@ mod tests {
 
     #[test]
     fn stash_branch_creates_branch_from_stash() {
-        let (_dir, path, _oid) = make_test_repo();
-        let mut repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let mut repo = git2::Repository::open(path).unwrap();
 
         fs::write(path.join("file.txt"), "stash changes").unwrap();
         repo.index()
@@ -3921,7 +3837,7 @@ mod tests {
 
         // Get stash OID using a separate repo instance for stash_foreach
         let stash_oid = {
-            let mut r = git2::Repository::open(&path).unwrap();
+            let mut r = git2::Repository::open(path).unwrap();
             let mut found = git2::Oid::zero();
             r.stash_foreach(|_i, _msg, oid| {
                 found = *oid;
@@ -3951,8 +3867,9 @@ mod tests {
 
     #[test]
     fn reset_hard_discards_changes() {
-        let (_dir, path, _oid) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         fs::write(path.join("file.txt"), "modified").unwrap();
         repo.index()
@@ -3976,8 +3893,9 @@ mod tests {
         // Note: git2's reset(Soft) does NOT stage the diff like CLI git reset --soft.
         // It moves HEAD and resets the index to match the target commit. We re-stage
         // the file after reset to emulate the CLI behavior and verify it works.
-        let (_dir, path, _oid) = make_test_repo_with_commits(2);
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = TempRepo::with_commits(2);
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         // Add a change on top of the current HEAD
         fs::write(path.join("file.txt"), "extra").unwrap();
@@ -4007,21 +3925,14 @@ mod tests {
         repo.index().unwrap().write().unwrap();
 
         // Commit the re-staged change
-        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
         let new_head_oid = repo.head().unwrap().target().unwrap();
-        let new_parent = repo.find_commit(new_head_oid).unwrap();
         let tree_oid = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-        let _new_commit_oid = repo
-            .commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                "reset soft with re-staged change",
-                &tree,
-                &[&new_parent],
-            )
-            .unwrap();
+        fixture.commit_tree(
+            Some("HEAD"),
+            "reset soft with re-staged change",
+            tree_oid,
+            &[new_head_oid],
+        );
 
         // The new commit should have the "extra" file in its tree
         let new_tree = repo
@@ -4036,8 +3947,9 @@ mod tests {
     #[test]
     fn reset_mixed_unsets_index() {
         // Mixed reset: index is cleared, but working tree file stays.
-        let (_dir, path, _oid) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         fs::write(path.join("file.txt"), "modified").unwrap();
         repo.index()
@@ -4059,8 +3971,9 @@ mod tests {
 
     #[test]
     fn reset_to_commit_moves_head() {
-        let (_dir, path, _oid) = make_test_repo_with_commits(3);
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = TempRepo::with_commits(3);
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         let commits = collect_commits(&repo);
         let first_oid = *commits.last().unwrap(); // oldest
@@ -4079,25 +3992,20 @@ mod tests {
 
     #[test]
     fn merge_branch_fast_forward() {
-        let (_dir, path, _oid) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
-        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
         let head_oid = repo.head().unwrap().target().unwrap();
-        let head = repo.find_commit(head_oid).unwrap();
 
         fs::write(path.join("file.txt"), "branch changes").unwrap();
         let tree_oid = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-        repo.commit(
+        fixture.commit_tree(
             Some("refs/heads/feature"),
-            &sig,
-            &sig,
             "feature commit",
-            &tree,
-            &[&head],
-        )
-        .unwrap();
+            tree_oid,
+            &[head_oid],
+        );
 
         let feature_branch = repo
             .find_branch("feature", git2::BranchType::Local)
@@ -4118,10 +4026,9 @@ mod tests {
     #[test]
     #[ignore = "git2's merge does not create conflict markers for trivial content changes; libgit2 auto-merges non-overlapping modifications without conflict markers. Use GitProject::merge_branch integration tests instead."]
     fn merge_branch_with_conflict() {
-        let (_dir, path, _oid) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
-
-        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         // Commit on main with a single-line file
         fs::write(path.join("file.txt"), "line one\n").unwrap();
@@ -4131,18 +4038,13 @@ mod tests {
             idx.write().unwrap();
         }
         let tree_oid = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
         let head_oid = repo.head().unwrap().target().unwrap();
-        let head = repo.find_commit(head_oid).unwrap();
-        repo.commit(
+        fixture.commit_tree(
             Some("refs/heads/main"),
-            &sig,
-            &sig,
             "main change",
-            &tree,
-            &[&head],
-        )
-        .unwrap();
+            tree_oid,
+            &[head_oid],
+        );
 
         // Feature branch: modify the SAME LINE differently (creates real conflict)
         fs::write(path.join("file.txt"), "main one\n").unwrap();
@@ -4152,18 +4054,13 @@ mod tests {
             idx.write().unwrap();
         }
         let tree_oid = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
         let head_oid = repo.head().unwrap().target().unwrap();
-        let head = repo.find_commit(head_oid).unwrap();
-        repo.commit(
+        fixture.commit_tree(
             Some("refs/heads/feature"),
-            &sig,
-            &sig,
             "feature change",
-            &tree,
-            &[&head],
-        )
-        .unwrap();
+            tree_oid,
+            &[head_oid],
+        );
 
         // Switch back to main (force checkout)
         {
@@ -4197,10 +4094,9 @@ mod tests {
     #[test]
     #[ignore = "git2's merge does not produce conflict markers for non-overlapping content changes (unlike CLI git). Tests git2 merge semantics, not application behavior."]
     fn abort_operation_cleans_merge_state() {
-        let (_dir, path, _oid) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
-
-        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         // Commit on main with single-line file
         fs::write(path.join("file.txt"), "line one\n").unwrap();
@@ -4210,18 +4106,13 @@ mod tests {
             idx.write().unwrap();
         }
         let tree_oid = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
         let head_oid = repo.head().unwrap().target().unwrap();
-        let head = repo.find_commit(head_oid).unwrap();
-        repo.commit(
+        fixture.commit_tree(
             Some("refs/heads/main"),
-            &sig,
-            &sig,
             "main change",
-            &tree,
-            &[&head],
-        )
-        .unwrap();
+            tree_oid,
+            &[head_oid],
+        );
 
         // Feature branch: modify the SAME LINE differently (creates real conflict)
         fs::write(path.join("file.txt"), "other one\n").unwrap();
@@ -4231,18 +4122,13 @@ mod tests {
             idx.write().unwrap();
         }
         let tree_oid = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
         let head_oid = repo.head().unwrap().target().unwrap();
-        let head = repo.find_commit(head_oid).unwrap();
-        repo.commit(
+        fixture.commit_tree(
             Some("refs/heads/feature"),
-            &sig,
-            &sig,
             "feature change",
-            &tree,
-            &[&head],
-        )
-        .unwrap();
+            tree_oid,
+            &[head_oid],
+        );
 
         // Switch back to main (force checkout)
         {
@@ -4280,8 +4166,9 @@ mod tests {
 
     #[test]
     fn cherry_pick_creates_new_commit() {
-        let (_dir, path, _oid) = make_test_repo_with_commits(2);
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = TempRepo::with_commits(2);
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         let commits = collect_commits(&repo);
         let oldest_oid = *commits.last().unwrap();
@@ -4295,8 +4182,9 @@ mod tests {
 
     #[test]
     fn revert_creates_undo_commit() {
-        let (_dir, path, _oid) = make_test_repo_with_commits(2);
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = TempRepo::with_commits(2);
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         let commits = collect_commits(&repo);
         let oldest_oid = *commits.last().unwrap();
@@ -4315,8 +4203,10 @@ mod tests {
 
     #[test]
     fn create_and_delete_tag() {
-        let (_dir, path, head) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let head = fixture.head_oid();
+        let repo = git2::Repository::open(path).unwrap();
 
         let obj = repo.find_object(head, None).unwrap();
         repo.tag_lightweight("v1.0.0", &obj, false).unwrap();
@@ -4330,8 +4220,10 @@ mod tests {
 
     #[test]
     fn create_multiple_tags() {
-        let (_dir, path, head) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let head = fixture.head_oid();
+        let repo = git2::Repository::open(path).unwrap();
 
         let obj = repo.find_object(head, None).unwrap();
         repo.tag_lightweight("v1.0.0", &obj, false).unwrap();
@@ -4351,8 +4243,10 @@ mod tests {
 
     #[test]
     fn create_and_delete_branch() {
-        let (_dir, path, head) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let head = fixture.head_oid();
+        let repo = git2::Repository::open(path).unwrap();
 
         let commit = repo.find_commit(head).unwrap();
         repo.branch("feature", &commit, false).unwrap();
@@ -4373,8 +4267,10 @@ mod tests {
 
     #[test]
     fn rename_branch() {
-        let (_dir, path, head) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let head = fixture.head_oid();
+        let repo = git2::Repository::open(path).unwrap();
 
         let commit = repo.find_commit(head).unwrap();
         repo.branch("old-name", &commit, false).unwrap();
@@ -4395,8 +4291,9 @@ mod tests {
 
     #[test]
     fn create_branch_at_specific_commit() {
-        let (_dir, path, _oid) = make_test_repo_with_commits(3);
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = TempRepo::with_commits(3);
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         let commits = collect_commits(&repo);
         let second_oid = *commits.get(1).unwrap(); // second commit from newest
@@ -4416,8 +4313,10 @@ mod tests {
 
     #[test]
     fn create_and_remove_worktree() {
-        let (_dir, path, head) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let head = fixture.head_oid();
+        let repo = git2::Repository::open(path).unwrap();
 
         let worktree_path = path.join("../worktree-dir");
 
@@ -4428,7 +4327,7 @@ mod tests {
         assert_eq!(wt_repo.head().unwrap().target().unwrap(), head);
 
         let output = std::process::Command::new("git")
-            .current_dir(&path)
+            .current_dir(path)
             .args([
                 "worktree",
                 "remove",
@@ -4447,8 +4346,9 @@ mod tests {
 
     #[test]
     fn discard_changes_removes_staged_file() {
-        let (_dir, path, _oid) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         fs::write(path.join("newfile.txt"), "content").unwrap();
         repo.index()
@@ -4470,29 +4370,30 @@ mod tests {
 
     #[test]
     fn bisect_start_and_reset() {
-        let (_dir, path, _oid) = make_test_repo_with_commits(5);
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = TempRepo::with_commits(5);
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         let commits = collect_commits(&repo);
         let oldest_oid = *commits.last().unwrap();
         let newest_oid = commits[0];
 
         let output = std::process::Command::new("git")
-            .current_dir(&path)
+            .current_dir(path)
             .args(["bisect", "start"])
             .output()
             .unwrap();
         assert!(output.status.success());
 
         let output = std::process::Command::new("git")
-            .current_dir(&path)
+            .current_dir(path)
             .args(["bisect", "bad"])
             .output()
             .unwrap();
         assert!(output.status.success());
 
         let output = std::process::Command::new("git")
-            .current_dir(&path)
+            .current_dir(path)
             .args(["bisect", "good", &oldest_oid.to_string()])
             .output()
             .unwrap();
@@ -4501,7 +4402,7 @@ mod tests {
         assert!(path.join(".git").join("BISECT_START").exists());
 
         let output = std::process::Command::new("git")
-            .current_dir(&path)
+            .current_dir(path)
             .args(["bisect", "reset"])
             .output()
             .unwrap();
@@ -4517,12 +4418,11 @@ mod tests {
 
     #[test]
     fn checkout_branch_switches_head() {
-        let (_dir, path, _oid) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
-        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
         let head_oid = repo.head().unwrap().target().unwrap();
-        let head = repo.find_commit(head_oid).unwrap();
 
         fs::write(path.join("file.txt"), "feature").unwrap();
         {
@@ -4531,16 +4431,12 @@ mod tests {
             idx.write().unwrap();
         }
         let tree_oid = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-        repo.commit(
+        fixture.commit_tree(
             Some("refs/heads/feature"),
-            &sig,
-            &sig,
             "feature commit",
-            &tree,
-            &[&head],
-        )
-        .unwrap();
+            tree_oid,
+            &[head_oid],
+        );
 
         // Note: repo.commit does NOT update the working tree, so working tree still
         // has "feature" while HEAD (main) has no file.txt. safe() would refuse this
@@ -4557,8 +4453,9 @@ mod tests {
 
     #[test]
     fn checkout_commit_detaches_head() {
-        let (_dir, path, _oid) = make_test_repo_with_commits(3);
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = TempRepo::with_commits(3);
+        let path = fixture.path();
+        let repo = git2::Repository::open(path).unwrap();
 
         let commits = collect_commits(&repo);
         let second_oid = commits[1];
@@ -4581,8 +4478,10 @@ mod tests {
 
     #[test]
     fn commit_creates_new_commit() {
-        let (_dir, path, head) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let head = fixture.head_oid();
+        let repo = git2::Repository::open(path).unwrap();
 
         fs::write(path.join("file.txt"), "hello world").unwrap();
         repo.index()
@@ -4607,8 +4506,10 @@ mod tests {
 
     #[test]
     fn amend_commit_updates_message() {
-        let (_dir, path, head) = make_test_repo();
-        let repo = git2::Repository::open(&path).unwrap();
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let head = fixture.head_oid();
+        let repo = git2::Repository::open(path).unwrap();
 
         let sig = repo.signature().unwrap();
         let parent = repo.find_commit(head).unwrap();
@@ -4668,13 +4569,14 @@ mod tests {
     /// stream made `clean_untracked` a silent no-op that still reported success.
     #[test]
     fn git_clean_dry_run_reports_on_stdout() {
-        let (_dir, path, _oid) = make_test_repo();
+        let fixture = make_test_repo();
+        let path = fixture.path();
         fs::write(path.join("untracked.txt"), "scratch").unwrap();
         fs::create_dir(path.join("untracked_dir")).unwrap();
         fs::write(path.join("untracked_dir").join("inner.txt"), "scratch").unwrap();
 
         let output = super::super::git_command()
-            .current_dir(&path)
+            .current_dir(path)
             .args(["clean", "-n", "-fd"])
             .output()
             .unwrap();
