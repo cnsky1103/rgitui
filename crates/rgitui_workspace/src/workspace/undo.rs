@@ -47,9 +47,33 @@ pub enum UndoAction {
     UnstageFiles { paths: Vec<String> },
     /// Undo unstage: stage the file paths.
     StageFiles { paths: Vec<String> },
+    /// Undo an apply/revert of diff content: write the files back byte for byte.
+    ///
+    /// The bytes travel with the entry because the forward operation may have gone
+    /// through a three-way merge, and a reverse patch would then not restore the
+    /// working tree exactly. `before: None` means the file did not exist, so
+    /// undoing deletes it; `expected_after` protects later user edits.
+    RestoreWorktreeFiles {
+        snapshots: Vec<rgitui_git::WorktreeFileSnapshot>,
+    },
 }
 
 impl UndoEntry {
+    fn for_paths(
+        label: impl Into<String>,
+        action: UndoAction,
+        repo_path: PathBuf,
+        worktree_path: PathBuf,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            action,
+            created_at: Instant::now(),
+            repo_path,
+            worktree_path,
+        }
+    }
+
     pub fn is_expired(&self) -> bool {
         self.created_at.elapsed().as_secs() > UNDO_EXPIRY_SECS
     }
@@ -146,13 +170,26 @@ impl Workspace {
         };
         let repo_path = tab.project.read(cx).repo_path().to_path_buf();
         let worktree_path = self.effective_worktree_path(cx);
-        self.undo_stack.push(UndoEntry {
-            label: label.into(),
+        self.push_undo_for_paths(label, action, repo_path, worktree_path, cx);
+    }
+
+    /// Push an undo entry stamped with paths captured by the operation itself.
+    /// Asynchronous completions must use this instead of consulting the active
+    /// tab, which may have changed while the filesystem work was running.
+    pub fn push_undo_for_paths(
+        &mut self,
+        label: impl Into<String>,
+        action: UndoAction,
+        repo_path: PathBuf,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.undo_stack.push(UndoEntry::for_paths(
+            label,
             action,
-            created_at: Instant::now(),
             repo_path,
             worktree_path,
-        });
+        ));
         self.schedule_undo_expiry(cx);
         cx.notify();
     }
@@ -292,6 +329,16 @@ impl Workspace {
                     cx,
                 );
             }
+            UndoAction::RestoreWorktreeFiles { snapshots } => {
+                project.update(cx, |proj, cx| {
+                    proj.restore_worktree_files_at(snapshots, &worktree_path, cx)
+                        .detach();
+                });
+                // The restore performs a filesystem compare-and-swap in the
+                // background and can legitimately refuse after a later edit.
+                // Its operation event reports the actual result; do not show
+                // an optimistic success toast here.
+            }
         }
     }
 
@@ -320,6 +367,17 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_state(contents: &[u8]) -> rgitui_git::WorktreeFileState {
+        rgitui_git::WorktreeFileState {
+            contents: contents.to_vec(),
+            permissions: rgitui_git::WorktreeFilePermissions {
+                readonly: false,
+                #[cfg(unix)]
+                mode: 0o644,
+            },
+        }
+    }
 
     fn make_entry(label: &str) -> UndoEntry {
         UndoEntry {
@@ -492,8 +550,16 @@ mod tests {
             UndoAction::StageFiles {
                 paths: vec!["c.rs".into()],
             },
+            UndoAction::RestoreWorktreeFiles {
+                snapshots: vec![rgitui_git::WorktreeFileSnapshot {
+                    path: PathBuf::from("d.rs"),
+                    before: Some(file_state(b"before\n")),
+                    expected_after: Some(file_state(b"after\n")),
+                }],
+            },
         ];
 
+        let count = actions.len();
         let mut stack = UndoStack::new();
         for (i, action) in actions.into_iter().enumerate() {
             stack.push(UndoEntry {
@@ -504,11 +570,74 @@ mod tests {
                 worktree_path: PathBuf::new(),
             });
         }
-        assert_eq!(stack.count(), 7);
+        assert_eq!(stack.count(), count);
         // pop all back off without panicking
-        for _ in 0..7 {
+        for _ in 0..count {
             assert!(stack.pop().is_some());
         }
         assert!(stack.pop().is_none());
+    }
+
+    // ── worktree apply/revert undo ───────────────────────────────
+
+    #[test]
+    fn an_apply_undo_entry_carries_the_bytes_it_will_restore() {
+        let mut stack = UndoStack::new();
+        stack.push(UndoEntry {
+            label: "Applied hunk 1 of src/main.rs from a1b2c3d".to_string(),
+            action: UndoAction::RestoreWorktreeFiles {
+                snapshots: vec![
+                    rgitui_git::WorktreeFileSnapshot {
+                        path: PathBuf::from("src/main.rs"),
+                        before: Some(file_state(b"fn main() {}\n")),
+                        expected_after: Some(file_state(b"fn main() { run(); }\n")),
+                    },
+                    rgitui_git::WorktreeFileSnapshot {
+                        path: PathBuf::from("src/new.rs"),
+                        before: None,
+                        expected_after: Some(file_state(b"pub fn new() {}\n")),
+                    },
+                ],
+            },
+            created_at: Instant::now(),
+            repo_path: PathBuf::from("/repo"),
+            worktree_path: PathBuf::from("/repo"),
+        });
+
+        let entry = stack.pop().expect("the entry should be undoable");
+        let UndoAction::RestoreWorktreeFiles { snapshots } = entry.action else {
+            panic!("expected a worktree restore, got {:?}", entry.action);
+        };
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].path, PathBuf::from("src/main.rs"));
+        assert_eq!(
+            snapshots[0]
+                .before
+                .as_ref()
+                .map(|state| state.contents.as_slice()),
+            Some(&b"fn main() {}\n"[..])
+        );
+        assert_eq!(
+            snapshots[1].before, None,
+            "a file the apply created must be recorded as absent so undo deletes it"
+        );
+        assert_eq!(
+            entry.worktree_path,
+            PathBuf::from("/repo"),
+            "undo must route back to the worktree the files were written in"
+        );
+    }
+
+    #[test]
+    fn asynchronous_undo_entry_keeps_its_captured_origin_paths() {
+        let entry = UndoEntry::for_paths(
+            "Applied a hunk",
+            UndoAction::RestoreWorktreeFiles { snapshots: vec![] },
+            PathBuf::from("originating-repository"),
+            PathBuf::from("originating-worktree"),
+        );
+
+        assert_eq!(entry.repo_path, PathBuf::from("originating-repository"));
+        assert_eq!(entry.worktree_path, PathBuf::from("originating-worktree"));
     }
 }
