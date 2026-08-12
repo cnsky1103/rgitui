@@ -1,5 +1,164 @@
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-12
+
+A major workflow, safety, and interface release. Keyboard shortcuts are now
+fully configurable, selected commits can be prepared for squashing directly
+from the graph, and content from commits or stashes can be applied or reverted
+at file, hunk, or line level. It also closes command-injection and untracked-file
+data-loss paths, prevents historical diffs from staging unrelated working-tree
+changes, and makes branch-heavy repositories and commit details easier to
+navigate.
+
+> **Upgrade recommended:** repository configuration and commit messages can no
+> longer inject options or shell commands into network and interactive-rebase
+> operations, and fast-forward merges now preserve colliding untracked files.
+
+### Added
+
+- **User-definable keyboard shortcuts.** A hot-reloaded JSONC `keymap.json`
+  beside `settings.json` can rebind or remove every command. Invalid entries are
+  isolated, overlapping bindings and unreachable chords produce named warnings,
+  and the `?` panel reflects the effective live keymap. Generated keybinding
+  documentation and a JSON schema provide command-name completion. (#62, closes
+  #63)
+- **Squash selected commits from the graph.** `Shift`- or primary-modifier-click
+  selects a commit range; `s` or the context menu opens the interactive-rebase
+  dialog with a squash plan ready for confirmation. Gaps, cross-branch runs,
+  root commits, and unsupported merges are refused before execution. (#62)
+- **Apply or revert historical diff content.** Commit and stash diffs now offer
+  Apply and Revert for the current hunk, selected lines, or the whole file.
+  Defaults are `a` / `r` for the selection and `Alt+A` / `Alt+R` for the file,
+  and all four commands are rebindable. A three-way merge preserves unrelated
+  working-tree edits without touching the index, while overlapping edits fail
+  without writing partial results. (#69, closes #70)
+- **Exact undo for applied or reverted content.** The original file contents and
+  permissions are recorded. Undo restores them only if the file still matches
+  the operation's result, protecting edits made afterward and handling created
+  or removed files correctly. (#69)
+- **Branch filtering for large repositories.** Local and remote branch sections
+  have separate filters for name and branch-tip commit age, with local branches
+  also supporting **Only my branches**. Visible rows follow UI density: 12 in
+  Compact, 10 in Default, and 8 in Comfortable, with scrollbars for the rest.
+  (#72)
+- **Collapsible commit panel.** The commit form can collapse to a compact header
+  and expand again without losing its previous height, leaving more room for
+  commit details and changed files. (#72)
+
+### Changed
+
+- **Shortcuts use the platform's primary modifier consistently.** macOS shows
+  and uses `Cmd` where Windows and Linux use `Ctrl`; OS-reserved macOS chords
+  retain usable Control alternatives, and the Windows/Linux super key no longer
+  acts as Control. Labels now render `Cmd` rather than `Super` on macOS. (#60,
+  fixes #61; #67)
+- **Shortcut dispatch is focus- and context-aware.** Commands are registered as
+  GPUI actions instead of a hand-written key handler. Bare panel keys now act
+  only in their focused view, overlays resolve Escape through context depth,
+  and typeable bindings stand down while a text input has focus. (#62)
+- **Commit metadata is denser and clearer.** Local and matching remote refs on
+  the same commit are combined into one compact badge with a remote indicator
+  and tooltip; signed commits use a lock beside the SHA; horizontal padding is
+  reduced; and duplicate co-author trailers are collapsed case-insensitively.
+  The compact ref treatment also applies to the graph. (#72)
+- **Commit composition uses less vertical space.** Unnecessary space between
+  the description and co-author controls is removed, while compact text inputs
+  improve the file-search and branch-filter layouts. (#72)
+
+### Fixed
+
+#### Security and data safety
+
+- **Repository-controlled network arguments can no longer become Git options or
+  commands.** Remote and branch names are validated before reaching the CLI,
+  including names read from repository configuration, and fetch, pull, and push
+  pin Git's standard upload and receive-pack programs. (#64)
+- **Interactive-rebase messages no longer pass through shell interpolation.**
+  Reword messages are written to files consumed by `git commit --file`, and
+  rebase scratch data now lives in private temporary directories. (#64)
+- **Search and clone operands are option-safe.** `git grep` receives patterns
+  through `-e`, and clone URLs are separated with `--`, so leading-dash input
+  cannot be interpreted as a Git option. (#64)
+- **Fast-forward merges no longer overwrite colliding untracked files.** A safe
+  checkout runs before moving the branch ref, names conflicting paths, and
+  leaves HEAD and the working tree unchanged when the merge is refused. (#64)
+- **Apply and Revert stay inside the worktree.** Traversal paths, symlink or
+  reparse-point parents and targets, submodules, split non-regular type changes,
+  write races, and stale undo snapshots are rejected before mutation. (#69)
+
+#### Diffs and working-tree operations
+
+- **Historical diffs no longer masquerade as unstaged content or stage unrelated
+  worktree hunks.** Commit and stash diffs are explicitly classified, show
+  `Committed` or `Stashed`, and cannot emit stage or unstage requests. Stash
+  diffs also remain stable across status refreshes. (#65, fixes #66)
+- **Untracked files no longer block everyday Git operations unnecessarily.**
+  Checkout, pull, merge, cherry-pick, revert, and rebase reject tracked
+  modifications while allowing unrelated untracked files; Git still refuses
+  when an operation would overwrite one. (#64)
+- **Clean Untracked now performs the requested cleanup.** Its dry run reads
+  Git's stdout rather than the empty stderr stream, so the real clean executes
+  and reports the correct count. (#64)
+- **Literal wildcard-like filenames are diffed correctly.** Paths such as
+  `data[1].json` are treated as exact filenames rather than pathspec patterns.
+  (#64)
+- **Diff hunk actions stay inside the panel.** Apply/Revert and Stage/Unstage
+  controls are constrained in unified and split headers instead of overflowing
+  into adjacent panels. (#72)
+
+#### Keyboard and interface
+
+- **Keyboard commit submission matches the button.** Primary-modifier+Enter now
+  respects the Amend checkbox and the staged-changes guard. (#64)
+- **Font Size now affects the interface.** The stored preference scales the
+  rem-based UI while preserving the previous pixel size at the default setting.
+  (#64)
+- **Shortcut and focus regressions are corrected.** Space activates sidebar
+  rows; `?` does not open help while typing; Enter no longer both opens a result
+  and submits a query; affected lists support Home/End; and toolbar and help
+  labels advertise the real Fetch and global-search shortcuts. (#62)
+- **Commit-details scrolling is independent and predictable.** Short changed-file
+  lists stay fixed, a scrollbar appears only beyond four rows, metadata and file
+  lists scroll separately, and wheel input over files no longer moves metadata.
+  (#72)
+- **Scrollbar dragging tracks the pointer continuously.** Drag events refresh
+  during movement and are captured and consumed, preventing lag, snapping, and
+  interaction leaking into content behind the scrollbar. (#72)
+- **Branch-filter popovers render and interact correctly.** Compact inputs are
+  no longer clipped, and the popover occludes pointer movement so hover events
+  do not leak into branch rows behind it. (#72)
+- **Long commit metadata no longer steals the changed-files scroll target.**
+  Metadata is bounded to its own scroll region, leaving the file list
+  independently hover-scrollable. File search, margins, badges, and row padding
+  are tightened to avoid overflow. (#72)
+
+### Performance
+
+- **Worktree refreshes avoid repeatedly reading entire large modified files.**
+  Files over 64 KiB are fingerprinted from bounded samples at both ends. (#64)
+- **Git ref polling avoids walking and reading every ref every 300ms.** Directory
+  and file metadata detect broad ref changes while HEAD, the checked-out branch,
+  and `packed-refs` retain content hashing. (#64)
+- **Syntax colors avoid format-and-reparse work for every highlighted span,** and
+  unused libgit2 network and TLS default features are no longer built or linked.
+  (#64)
+
+### Internal
+
+- Added a cross-platform headless GPUI `ViewTest` harness with deterministic
+  keyboard and mouse simulation, safe teardown, and disk-free settings
+  initialization. (#59)
+- Consolidated temporary Git-repository helpers into `TempRepo`, with
+  deterministic commits, `main` as the initial branch, byte-stable line endings,
+  and Windows-safe cleanup ordering. (#71)
+- Expanded regression coverage for keymap conflicts and context resolution,
+  historical diff staging guards, Apply/Revert and exact undo, command-injection
+  vectors, safe checkout, branch filters, ref compaction, scrolling, and commit
+  panel collapse.
+- Updated CI and release actions to Node 24-native major versions, removed
+  accidentally tracked Python bytecode and obsolete test scaffolding, and
+  rewrote implementation comments around current invariants. (#58, #68)
+
 ## [0.3.2] - 2026-07-27
 
 A focused follow-up to 0.3.1. Blame and file history are prepared before you ask
@@ -791,7 +950,9 @@ establishes a feature-complete baseline for day-to-day use.
 - Only x86_64 Windows and Linux, and x86_64/aarch64 macOS are built by CI.
   Other architectures can be compiled locally with `cargo build --release`.
 
-[Unreleased]: https://github.com/noahbclarkson/rgitui/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/noahbclarkson/rgitui/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/noahbclarkson/rgitui/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/noahbclarkson/rgitui/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/noahbclarkson/rgitui/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/noahbclarkson/rgitui/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/noahbclarkson/rgitui/compare/v0.2.1...v0.2.2
